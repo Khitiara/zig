@@ -815,13 +815,14 @@ pub fn exit(status: u8) noreturn {
         linux.exit_group(status);
     }
     if (builtin.os.tag == .uefi) {
+        const uefi_status: uefi.Status = if (status == 0) .success else .load_error;
         // exit() is only available if exitBootServices() has not been called yet.
         // This call to exit should not fail, so we don't care about its return value.
         if (uefi.system_table.boot_services) |bs| {
-            _ = bs.exit(uefi.handle, @as(uefi.Status, @enumFromInt(status)), 0, null);
+            _ = bs.exit(uefi.handle, uefi_status, 0, null);
         }
         // If we can't exit, reboot the system instead.
-        uefi.system_table.runtime_services.resetSystem(uefi.tables.ResetType.ResetCold, @as(uefi.Status, @enumFromInt(status)), 0, null);
+        uefi.system_table.runtime_services.resetSystem(.cold, uefi_status, 0, null);
     }
     system.exit(status);
 }

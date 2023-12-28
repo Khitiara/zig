@@ -25,6 +25,10 @@ fn getStdOutHandle() os.fd_t {
         return root.os.io.getStdOutHandle();
     }
 
+    if (builtin.os.tag == .uefi) {
+        return .{ .simple_output = os.uefi.system_table.con_out.? };
+    }
+
     return os.STDOUT_FILENO;
 }
 
@@ -45,6 +49,10 @@ fn getStdErrHandle() os.fd_t {
         return root.os.io.getStdErrHandle();
     }
 
+    if (builtin.os.tag == .uefi) {
+        return .{ .simple_output = os.uefi.system_table.std_err.? };
+    }
+
     return os.STDERR_FILENO;
 }
 
@@ -63,6 +71,10 @@ fn getStdInHandle() os.fd_t {
 
     if (@hasDecl(root, "os") and @hasDecl(root.os, "io") and @hasDecl(root.os.io, "getStdInHandle")) {
         return root.os.io.getStdInHandle();
+    }
+
+    if (builtin.os.tag == .uefi) {
+        return .{ .simple_input = os.uefi.system_table.con_in.? };
     }
 
     return os.STDIN_FILENO;
