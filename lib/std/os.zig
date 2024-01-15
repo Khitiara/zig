@@ -819,7 +819,7 @@ pub fn exit(status: u8) noreturn {
         // exit() is only available if exitBootServices() has not been called yet.
         // This call to exit should not fail, so we don't care about its return value.
         if (uefi.system_table.boot_services) |bs| {
-            _ = bs.exit(uefi.handle, uefi_status, 0, null);
+            bs.exit(uefi.handle, uefi_status, 0, null) catch {};
         }
         // If we can't exit, reboot the system instead.
         uefi.system_table.runtime_services.resetSystem(.cold, uefi_status, 0, null);
@@ -861,6 +861,9 @@ pub fn read(fd: fd_t, buf: []u8) ReadError!usize {
     if (buf.len == 0) return 0;
     if (builtin.os.tag == .windows) {
         return windows.ReadFile(fd, buf, null);
+    }
+    if (builtin.os.tag == .uefi) {
+        return uefi.read(fd, buf);
     }
     if (builtin.os.tag == .wasi and !builtin.link_libc) {
         const iovs = [1]iovec{iovec{
@@ -1262,6 +1265,9 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
     if (bytes.len == 0) return 0;
     if (builtin.os.tag == .windows) {
         return windows.WriteFile(fd, bytes, null);
+    }
+    if (builtin.os.tag == .uefi) {
+        return uefi.write(fd, bytes);
     }
 
     if (builtin.os.tag == .wasi and !builtin.link_libc) {
