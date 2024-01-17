@@ -799,6 +799,14 @@ pub fn openFile(self: Dir, sub_path: []const u8, flags: File.OpenFlags) File.Ope
         }
         const fd = try posix.openatWasi(self.fd, sub_path, .{}, .{}, .{}, base, .{});
         return .{ .handle = fd };
+    if (builtin.os.tag == .uefi) {
+        var temp_path: std.os.windows.PathSpace = undefined;
+        temp_path.len = try std.unicode.utf8ToUtf16Le(&temp_path.data, sub_path);
+        temp_path.data[temp_path.len] = 0;
+        return self.openFileUefi(temp_path.span(), flags);
+    }
+    if (builtin.os.tag == .wasi and !builtin.link_libc) {
+        return self.openFileWasi(sub_path, flags);
     }
     const path_c = try posix.toPosixPath(sub_path);
     return self.openFileZ(&path_c, flags);
@@ -887,6 +895,8 @@ pub fn openFileZ(self: Dir, sub_path: [*:0]const u8, flags: File.OpenFlags) File
 /// Same as `openFile` but Windows-only and the path parameter is
 /// [WTF-16](https://simonsapin.github.io/wtf-8/#potentially-ill-formed-utf-16) encoded.
 pub fn openFileW(self: Dir, sub_path_w: []const u16, flags: File.OpenFlags) File.OpenError!File {
+    if (builtin.os.tag == .uefi) {}
+
     const w = std.os.windows;
     const file: File = .{
         .handle = try w.OpenFile(sub_path_w, .{
@@ -921,6 +931,23 @@ pub fn openFileW(self: Dir, sub_path_w: []const u16, flags: File.OpenFlags) File
     return file;
 }
 
+/// Same as `openFile` but UEFI-only and the path parameter is null terminated UTF-16
+pub fn openFileUefi(self: Dir, sub_path_w: [:0]const u16, flags: File.OpenFlags) File.OpenError!File {
+    const uefi = std.os.uefi;
+
+    const handle = try uefi.openat(self.fd, sub_path_w, .{
+        .read = flags.isRead(),
+        .write = flags.isWrite(),
+    });
+    errdefer uefi.close(handle);
+
+    return File{
+        .handle = handle,
+        .capable_io_mode = std.io.default_mode,
+        .intended_io_mode = flags.intended_io_mode,
+    };
+}
+
 /// Creates, opens, or overwrites a file with write access.
 /// Call `File.close` on the result when done.
 /// Asserts that the path parameter has no null bytes.
@@ -953,6 +980,14 @@ pub fn createFile(self: Dir, sub_path: []const u8, flags: File.CreateFlags) File
                 .FD_FILESTAT_GET = true,
             }, .{}),
         };
+    if (builtin.os.tag == .uefi) {
+        var temp_path: std.os.windows.PathSpace = undefined;
+        temp_path.len = try std.unicode.utf8ToUtf16Le(&temp_path.data, sub_path);
+        temp_path.data[temp_path.len] = 0;
+        return self.createFileUefi(temp_path.span(), flags);
+    }
+    if (builtin.os.tag == .wasi and !builtin.link_libc) {
+        return self.createFileWasi(sub_path, flags);
     }
     const path_c = try posix.toPosixPath(sub_path);
     return self.createFileZ(&path_c, flags);
@@ -1071,6 +1106,24 @@ pub fn createFileW(self: Dir, sub_path_w: []const u16, flags: File.CreateFlags) 
         @intFromBool(exclusive),
     );
     return file;
+}
+
+/// Same as `createFile` but UEFI-only and the path parameter is null terminated UTF-16
+pub fn createFileUefi(self: Dir, sub_path_w: [:0]const u16, flags: File.OpenFlags) File.OpenError!File {
+    const uefi = std.os.uefi;
+
+    const handle = try uefi.openat(self.fd, sub_path_w, .{
+        .read = true,
+        .write = true,
+        .create = true,
+    });
+    errdefer uefi.close(handle);
+
+    return File{
+        .handle = handle,
+        .capable_io_mode = std.io.default_mode,
+        .intended_io_mode = flags.intended_io_mode,
+    };
 }
 
 /// Creates a single directory with a relative or absolute path.

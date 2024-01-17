@@ -247,6 +247,8 @@ pub fn renameW(old_dir: Dir, old_sub_path_w: []const u16, new_dir: Dir, new_sub_
 pub fn cwd() Dir {
     if (builtin.os.tag == .windows) {
         return .{ .fd = os.windows.peb().ProcessParameters.CurrentDirectory.Handle };
+    } else if (builtin.os.tag == .uefi) {
+        return defaultUefiCwd();
     } else if (builtin.os.tag == .wasi) {
         return .{ .fd = std.options.wasiCwd() };
     } else {
@@ -257,6 +259,20 @@ pub fn cwd() Dir {
 pub fn defaultWasiCwd() std.os.wasi.fd_t {
     // Expect the first preopen to be current working directory.
     return 3;
+}
+
+pub fn defaultUefiCwd() Dir {
+    const uefi = std.os.uefi;
+
+    if (uefi.system_table.boot_services) |boot_services| blk: {
+        const loaded_image = boot_services.openProtocol(uefi.handle, uefi.protocol.LoadedImage, uefi.handle, null, .{ .by_handle_protocol = true }) catch break :blk orelse break :blk;
+
+        const simple_file_system = boot_services.openProtocol(loaded_image.device_handle.?, uefi.protocol.SimpleFileSystem, uefi.handle, null, .{ .by_handle_protocol = true }) catch break :blk orelse break :blk;
+
+        return Dir{ .fd = .{ .file = simple_file_system.openVolume() catch break :blk } };
+    }
+
+    return Dir{ .fd = .none };
 }
 
 /// Opens a directory at the given path. The directory is a system resource that remains

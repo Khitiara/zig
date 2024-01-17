@@ -238,6 +238,14 @@ pub const SeekError = posix.SeekError;
 /// Repositions read/write file offset relative to the current offset.
 /// TODO: integrate with async I/O
 pub fn seekBy(self: File, offset: i64) SeekError!void {
+    if (builtin.os.tag == .uefi) {
+        if (self.handle == .file) {
+            return self.handle.file.movePosition(offset) catch return error.Unseekable;
+        } else {
+            return error.Unseekable;
+        }
+    }
+
     return posix.lseek_CUR(self.handle, offset);
 }
 
@@ -250,6 +258,14 @@ pub fn seekFromEnd(self: File, offset: i64) SeekError!void {
 /// Repositions read/write file offset relative to the beginning.
 /// TODO: integrate with async I/O
 pub fn seekTo(self: File, offset: u64) SeekError!void {
+    if (builtin.os.tag == .uefi) {
+        if (self.handle == .file) {
+            return self.handle.file.setPosition(offset) catch return error.Unseekable;
+        } else {
+            return error.Unseekable;
+        }
+    }
+
     return posix.lseek_SET(self.handle, offset);
 }
 
@@ -257,6 +273,14 @@ pub const GetSeekPosError = posix.SeekError || posix.FStatError;
 
 /// TODO: integrate with async I/O
 pub fn getPos(self: File) GetSeekPosError!u64 {
+    if (builtin.os.tag == .uefi) {
+        if (self.handle == .file) {
+            return self.handle.file.getPosition() catch return error.Unseekable;
+        } else {
+            return error.Unseekable;
+        }
+    }
+
     return posix.lseek_CUR_get(self.handle);
 }
 
@@ -264,6 +288,13 @@ pub fn getPos(self: File) GetSeekPosError!u64 {
 pub fn getEndPos(self: File) GetSeekPosError!u64 {
     if (builtin.os.tag == .windows) {
         return windows.GetFileSizeEx(self.handle);
+    }
+    if (builtin.os.tag == .uefi) {
+        if (self.handle == .file) {
+            return self.handle.file.getEndPosition() catch return error.Unseekable;
+        } else {
+            return error.Unseekable;
+        }
     }
     return (try self.stat()).size;
 }
