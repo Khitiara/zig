@@ -745,6 +745,7 @@ test "directory operations on files" {
 test "file operations on directories" {
     // TODO: fix this test on FreeBSD. https://github.com/ziglang/zig/issues/1759
     if (native_os == .freebsd) return error.SkipZigTest;
+    if (native_os == .wasi and builtin.link_libc) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/20747
 
     try testWithAllSupportedPathTypes(struct {
         fn impl(ctx: *TestContext) !void {
@@ -1269,11 +1270,11 @@ test "max file name component lengths" {
     } else if (native_os == .wasi) {
         // On WASI, the maxed filename depends on the host OS, so in order for this test to
         // work on any host, we need to use a length that will work for all platforms
-        // (i.e. the minimum MAX_NAME_BYTES of all supported platforms).
+        // (i.e. the minimum max_name_bytes of all supported platforms).
         const maxed_wasi_filename = [_]u8{'1'} ** 255;
         try testFilenameLimits(tmp.dir, &maxed_wasi_filename);
     } else {
-        const maxed_ascii_filename = [_]u8{'1'} ** std.fs.MAX_NAME_BYTES;
+        const maxed_ascii_filename = [_]u8{'1'} ** std.fs.max_name_bytes;
         try testFilenameLimits(tmp.dir, &maxed_ascii_filename);
     }
 }
