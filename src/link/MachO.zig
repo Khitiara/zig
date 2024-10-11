@@ -1,5 +1,7 @@
 base: link.File,
 
+rpath_list: []const []const u8,
+
 /// If this is not null, an object file is created by LLVM and emitted to zcu_object_sub_path.
 llvm_object: ?LlvmObject.Ptr = null,
 
@@ -25,7 +27,7 @@ sections: std.MultiArrayList(Section) = .{},
 resolver: SymbolResolver = .{},
 /// This table will be populated after `scanRelocs` has run.
 /// Key is symbol index.
-undefs: std.AutoArrayHashMapUnmanaged(SymbolResolver.Index, std.ArrayListUnmanaged(Ref)) = .empty,
+undefs: std.AutoArrayHashMapUnmanaged(SymbolResolver.Index, UndefRefs) = .empty,
 undefs_mutex: std.Thread.Mutex = .{},
 dupes: std.AutoArrayHashMapUnmanaged(SymbolResolver.Index, std.ArrayListUnmanaged(File.Index)) = .empty,
 dupes_mutex: std.Thread.Mutex = .{},
@@ -192,8 +194,8 @@ pub fn createEmpty(
             .file = null,
             .disable_lld_caching = options.disable_lld_caching,
             .build_id = options.build_id,
-            .rpath_list = options.rpath_list,
         },
+        .rpath_list = options.rpath_list,
         .pagezero_size = options.pagezero_size,
         .headerpad_size = options.headerpad_size,
         .headerpad_max_install_names = options.headerpad_max_install_names,
@@ -662,9 +664,8 @@ fn dumpArgv(self: *MachO, comp: *Compilation) !void {
             try argv.append(syslibroot);
         }
 
-        for (self.base.rpath_list) |rpath| {
-            try argv.append("-rpath");
-            try argv.append(rpath);
+        for (self.rpath_list) |rpath| {
+            try argv.appendSlice(&.{ "-rpath", rpath });
         }
 
         if (self.pagezero_size) |size| {
@@ -1469,6 +1470,9 @@ fn scanRelocs(self: *MachO) !void {
 
     if (self.has_errors.swap(false, .seq_cst)) return error.FlushFailure;
 
+    if (self.getInternalObject()) |obj| {
+        try obj.checkUndefs(self);
+    }
     try self.reportUndefs();
 
     if (self.getZigObject()) |zo| {
@@ -1529,29 +1533,43 @@ fn reportUndefs(self: *MachO) !void {
         }
     }.lessThan;
 
-    for (self.undefs.values()) |*refs| {
-        mem.sort(Ref, refs.items, {}, refLessThan);
-    }
+    for (self.undefs.values()) |*undefs| switch (undefs.*) {
+        .refs => |refs| mem.sort(Ref, refs.items, {}, refLessThan),
+        else => {},
+    };
 
     for (keys.items) |key| {
         const undef_sym = self.resolver.keys.items[key - 1];
         const notes = self.undefs.get(key).?;
-        const nnotes = @min(notes.items.len, max_notes) + @intFromBool(notes.items.len > max_notes);
+        const nnotes = nnotes: {
+            const nnotes = switch (notes) {
+                .refs => |refs| refs.items.len,
+                else => 1,
+            };
+            break :nnotes @min(nnotes, max_notes) + @intFromBool(nnotes > max_notes);
+        };
 
         var err = try self.base.addErrorWithNotes(nnotes);
         try err.addMsg("undefined symbol: {s}", .{undef_sym.getName(self)});
 
-        var inote: usize = 0;
-        while (inote < @min(notes.items.len, max_notes)) : (inote += 1) {
-            const note = notes.items[inote];
-            const file = self.getFile(note.file).?;
-            const atom = note.getAtom(self).?;
-            try err.addNote("referenced by {}:{s}", .{ file.fmtPath(), atom.getName(self) });
-        }
+        switch (notes) {
+            .force_undefined => try err.addNote("referenced with linker flag -u", .{}),
+            .entry => try err.addNote("referenced with linker flag -e", .{}),
+            .dyld_stub_binder, .objc_msgsend => try err.addNote("referenced implicitly", .{}),
+            .refs => |refs| {
+                var inote: usize = 0;
+                while (inote < @min(refs.items.len, max_notes)) : (inote += 1) {
+                    const ref = refs.items[inote];
+                    const file = self.getFile(ref.file).?;
+                    const atom = ref.getAtom(self).?;
+                    try err.addNote("referenced by {}:{s}", .{ file.fmtPath(), atom.getName(self) });
+                }
 
-        if (notes.items.len > max_notes) {
-            const remaining = notes.items.len - max_notes;
-            try err.addNote("referenced {d} more times", .{remaining});
+                if (refs.items.len > max_notes) {
+                    const remaining = refs.items.len - max_notes;
+                    try err.addNote("referenced {d} more times", .{remaining});
+                }
+            },
         }
     }
 
@@ -2842,7 +2860,7 @@ fn writeLoadCommands(self: *MachO) !struct { usize, usize, u64 } {
         ncmds += 1;
     }
 
-    for (self.base.rpath_list) |rpath| {
+    for (self.rpath_list) |rpath| {
         try load_commands.writeRpathLC(rpath, writer);
         ncmds += 1;
     }
@@ -3230,7 +3248,7 @@ fn initMetadata(self: *MachO, options: InitMetadataOptions) !void {
             self.zig_text_seg_index = try self.addSegment("__TEXT_ZIG", .{
                 .fileoff = off,
                 .filesize = filesize,
-                .vmaddr = base_vmaddr + 0x8000000,
+                .vmaddr = base_vmaddr + 0x4000000,
                 .vmsize = filesize,
                 .prot = macho.PROT.READ | macho.PROT.EXEC,
             });
@@ -3542,8 +3560,8 @@ pub fn requiresCodeSig(self: MachO) bool {
     const target = self.getTarget();
     return switch (target.cpu.arch) {
         .aarch64 => switch (target.os.tag) {
-            .macos => true,
-            .watchos, .tvos, .ios, .visionos => target.abi == .simulator,
+            .bridgeos, .driverkit, .macos => true,
+            .ios, .tvos, .visionos, .watchos => target.abi == .simulator,
             else => false,
         },
         .x86_64 => false,
@@ -4172,36 +4190,38 @@ pub const Platform = struct {
                 const cmd = lc.cast(macho.build_version_command).?;
                 return .{
                     .os_tag = switch (cmd.platform) {
-                        .MACOS => .macos,
+                        .BRIDGEOS => .bridgeos,
+                        .DRIVERKIT => .driverkit,
                         .IOS, .IOSSIMULATOR => .ios,
-                        .TVOS, .TVOSSIMULATOR => .tvos,
-                        .WATCHOS, .WATCHOSSIMULATOR => .watchos,
                         .MACCATALYST => .ios,
+                        .MACOS => .macos,
+                        .TVOS, .TVOSSIMULATOR => .tvos,
                         .VISIONOS, .VISIONOSSIMULATOR => .visionos,
+                        .WATCHOS, .WATCHOSSIMULATOR => .watchos,
                         else => @panic("TODO"),
                     },
                     .abi = switch (cmd.platform) {
                         .MACCATALYST => .macabi,
                         .IOSSIMULATOR,
                         .TVOSSIMULATOR,
-                        .WATCHOSSIMULATOR,
                         .VISIONOSSIMULATOR,
+                        .WATCHOSSIMULATOR,
                         => .simulator,
                         else => .none,
                     },
                     .version = appleVersionToSemanticVersion(cmd.minos),
                 };
             },
-            .VERSION_MIN_MACOSX,
             .VERSION_MIN_IPHONEOS,
+            .VERSION_MIN_MACOSX,
             .VERSION_MIN_TVOS,
             .VERSION_MIN_WATCHOS,
             => {
                 const cmd = lc.cast(macho.version_min_command).?;
                 return .{
                     .os_tag = switch (lc.cmd()) {
-                        .VERSION_MIN_MACOSX => .macos,
                         .VERSION_MIN_IPHONEOS => .ios,
+                        .VERSION_MIN_MACOSX => .macos,
                         .VERSION_MIN_TVOS => .tvos,
                         .VERSION_MIN_WATCHOS => .watchos,
                         else => unreachable,
@@ -4228,15 +4248,17 @@ pub const Platform = struct {
 
     pub fn toApplePlatform(plat: Platform) macho.PLATFORM {
         return switch (plat.os_tag) {
-            .macos => .MACOS,
+            .bridgeos => .BRIDGEOS,
+            .driverkit => .DRIVERKIT,
             .ios => switch (plat.abi) {
-                .simulator => .IOSSIMULATOR,
                 .macabi => .MACCATALYST,
+                .simulator => .IOSSIMULATOR,
                 else => .IOS,
             },
+            .macos => .MACOS,
             .tvos => if (plat.abi == .simulator) .TVOSSIMULATOR else .TVOS,
-            .watchos => if (plat.abi == .simulator) .WATCHOSSIMULATOR else .WATCHOS,
             .visionos => if (plat.abi == .simulator) .VISIONOSSIMULATOR else .VISIONOS,
+            .watchos => if (plat.abi == .simulator) .WATCHOSSIMULATOR else .WATCHOS,
             else => unreachable,
         };
     }
@@ -4305,15 +4327,18 @@ const SupportedPlatforms = struct {
 // Source: https://github.com/apple-oss-distributions/ld64/blob/59a99ab60399c5e6c49e6945a9e1049c42b71135/src/ld/PlatformSupport.cpp#L52
 // zig fmt: off
 const supported_platforms = [_]SupportedPlatforms{
-    .{ .macos,    .none,      0xA0E00, 0xA0800 },
-    .{ .ios,      .none,      0xC0000, 0x70000 },
-    .{ .tvos,     .none,      0xC0000, 0x70000 },
-    .{ .watchos,  .none,      0x50000, 0x20000 },
-    .{ .visionos, .none,      0x10000, 0x10000 },
-    .{ .ios,      .simulator, 0xD0000, 0x80000 },
-    .{ .tvos,     .simulator, 0xD0000, 0x80000 },
-    .{ .watchos,  .simulator, 0x60000, 0x20000 },
-    .{ .visionos, .simulator, 0x10000, 0x10000 },
+    .{ .bridgeos,  .none,      0x010000, 0x010000 },
+    .{ .driverkit, .none,      0x130000, 0x130000 },
+    .{ .ios,       .none,      0x0C0000, 0x070000 },
+    .{ .ios,       .macabi,    0x0D0000, 0x0D0000 },
+    .{ .ios,       .simulator, 0x0D0000, 0x080000 },
+    .{ .macos,     .none,      0x0A0E00, 0x0A0800 },
+    .{ .tvos,      .none,      0x0C0000, 0x070000 },
+    .{ .tvos,      .simulator, 0x0D0000, 0x080000 },
+    .{ .visionos,  .none,      0x010000, 0x010000 },
+    .{ .visionos,  .simulator, 0x010000, 0x010000 },
+    .{ .watchos,   .none,      0x050000, 0x020000 },
+    .{ .watchos,   .simulator, 0x060000, 0x020000 },
 };
 // zig fmt: on
 
@@ -4576,78 +4601,20 @@ pub const String = struct {
     len: u32 = 0,
 };
 
-const MachO = @This();
+pub const UndefRefs = union(enum) {
+    force_undefined,
+    entry,
+    dyld_stub_binder,
+    objc_msgsend,
+    refs: std.ArrayListUnmanaged(Ref),
 
-const std = @import("std");
-const build_options = @import("build_options");
-const builtin = @import("builtin");
-const assert = std.debug.assert;
-const fs = std.fs;
-const log = std.log.scoped(.link);
-const state_log = std.log.scoped(.link_state);
-const macho = std.macho;
-const math = std.math;
-const mem = std.mem;
-const meta = std.meta;
-
-const aarch64 = @import("../arch/aarch64/bits.zig");
-const bind = @import("MachO/dyld_info/bind.zig");
-const calcUuid = @import("MachO/uuid.zig").calcUuid;
-const codegen = @import("../codegen.zig");
-const dead_strip = @import("MachO/dead_strip.zig");
-const eh_frame = @import("MachO/eh_frame.zig");
-const fat = @import("MachO/fat.zig");
-const link = @import("../link.zig");
-const load_commands = @import("MachO/load_commands.zig");
-const relocatable = @import("MachO/relocatable.zig");
-const tapi = @import("tapi.zig");
-const target_util = @import("../target.zig");
-const trace = @import("../tracy.zig").trace;
-const synthetic = @import("MachO/synthetic.zig");
-
-const Air = @import("../Air.zig");
-const Alignment = Atom.Alignment;
-const Allocator = mem.Allocator;
-const Archive = @import("MachO/Archive.zig");
-pub const Atom = @import("MachO/Atom.zig");
-const AtomicBool = std.atomic.Value(bool);
-const Bind = bind.Bind;
-const Cache = std.Build.Cache;
-const Path = Cache.Path;
-const CodeSignature = @import("MachO/CodeSignature.zig");
-const Compilation = @import("../Compilation.zig");
-const DataInCode = synthetic.DataInCode;
-pub const DebugSymbols = @import("MachO/DebugSymbols.zig");
-const Dylib = @import("MachO/Dylib.zig");
-const ExportTrie = @import("MachO/dyld_info/Trie.zig");
-const File = @import("MachO/file.zig").File;
-const GotSection = synthetic.GotSection;
-const Hash = std.hash.Wyhash;
-const Indsymtab = synthetic.Indsymtab;
-const InternalObject = @import("MachO/InternalObject.zig");
-const ObjcStubsSection = synthetic.ObjcStubsSection;
-const Object = @import("MachO/Object.zig");
-const LazyBind = bind.LazyBind;
-const LaSymbolPtrSection = synthetic.LaSymbolPtrSection;
-const Liveness = @import("../Liveness.zig");
-const LlvmObject = @import("../codegen/llvm.zig").Object;
-const Md5 = std.crypto.hash.Md5;
-const Zcu = @import("../Zcu.zig");
-const InternPool = @import("../InternPool.zig");
-const Rebase = @import("MachO/dyld_info/Rebase.zig");
-pub const Relocation = @import("MachO/Relocation.zig");
-const StringTable = @import("StringTable.zig");
-const StubsSection = synthetic.StubsSection;
-const StubsHelperSection = synthetic.StubsHelperSection;
-const Symbol = @import("MachO/Symbol.zig");
-const Thunk = @import("MachO/Thunk.zig");
-const TlvPtrSection = synthetic.TlvPtrSection;
-const Value = @import("../Value.zig");
-const UnwindInfo = @import("MachO/UnwindInfo.zig");
-const WaitGroup = std.Thread.WaitGroup;
-const WeakBind = bind.WeakBind;
-const ZigObject = @import("MachO/ZigObject.zig");
-const dev = @import("../dev.zig");
+    pub fn deinit(self: *UndefRefs, allocator: Allocator) void {
+        switch (self.*) {
+            .refs => |*refs| refs.deinit(allocator),
+            else => {},
+        }
+    }
+};
 
 pub const MachError = error{
     /// Not enough permissions held to perform the requested kernel
@@ -5384,3 +5351,76 @@ const max_distance = (1 << (jump_bits - 1));
 /// mold uses 5MiB margin, while ld64 uses 4MiB margin. We will follow mold
 /// and assume margin to be 5MiB.
 const max_allowed_distance = max_distance - 0x500_000;
+
+const MachO = @This();
+
+const std = @import("std");
+const build_options = @import("build_options");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const fs = std.fs;
+const log = std.log.scoped(.link);
+const state_log = std.log.scoped(.link_state);
+const macho = std.macho;
+const math = std.math;
+const mem = std.mem;
+const meta = std.meta;
+
+const aarch64 = @import("../arch/aarch64/bits.zig");
+const bind = @import("MachO/dyld_info/bind.zig");
+const calcUuid = @import("MachO/uuid.zig").calcUuid;
+const codegen = @import("../codegen.zig");
+const dead_strip = @import("MachO/dead_strip.zig");
+const eh_frame = @import("MachO/eh_frame.zig");
+const fat = @import("MachO/fat.zig");
+const link = @import("../link.zig");
+const load_commands = @import("MachO/load_commands.zig");
+const relocatable = @import("MachO/relocatable.zig");
+const tapi = @import("tapi.zig");
+const target_util = @import("../target.zig");
+const trace = @import("../tracy.zig").trace;
+const synthetic = @import("MachO/synthetic.zig");
+
+const Air = @import("../Air.zig");
+const Alignment = Atom.Alignment;
+const Allocator = mem.Allocator;
+const Archive = @import("MachO/Archive.zig");
+pub const Atom = @import("MachO/Atom.zig");
+const AtomicBool = std.atomic.Value(bool);
+const Bind = bind.Bind;
+const Cache = std.Build.Cache;
+const Path = Cache.Path;
+const CodeSignature = @import("MachO/CodeSignature.zig");
+const Compilation = @import("../Compilation.zig");
+const DataInCode = synthetic.DataInCode;
+pub const DebugSymbols = @import("MachO/DebugSymbols.zig");
+const Dylib = @import("MachO/Dylib.zig");
+const ExportTrie = @import("MachO/dyld_info/Trie.zig");
+const File = @import("MachO/file.zig").File;
+const GotSection = synthetic.GotSection;
+const Hash = std.hash.Wyhash;
+const Indsymtab = synthetic.Indsymtab;
+const InternalObject = @import("MachO/InternalObject.zig");
+const ObjcStubsSection = synthetic.ObjcStubsSection;
+const Object = @import("MachO/Object.zig");
+const LazyBind = bind.LazyBind;
+const LaSymbolPtrSection = synthetic.LaSymbolPtrSection;
+const Liveness = @import("../Liveness.zig");
+const LlvmObject = @import("../codegen/llvm.zig").Object;
+const Md5 = std.crypto.hash.Md5;
+const Zcu = @import("../Zcu.zig");
+const InternPool = @import("../InternPool.zig");
+const Rebase = @import("MachO/dyld_info/Rebase.zig");
+pub const Relocation = @import("MachO/Relocation.zig");
+const StringTable = @import("StringTable.zig");
+const StubsSection = synthetic.StubsSection;
+const StubsHelperSection = synthetic.StubsHelperSection;
+const Symbol = @import("MachO/Symbol.zig");
+const Thunk = @import("MachO/Thunk.zig");
+const TlvPtrSection = synthetic.TlvPtrSection;
+const Value = @import("../Value.zig");
+const UnwindInfo = @import("MachO/UnwindInfo.zig");
+const WaitGroup = std.Thread.WaitGroup;
+const WeakBind = bind.WeakBind;
+const ZigObject = @import("MachO/ZigObject.zig");
+const dev = @import("../dev.zig");

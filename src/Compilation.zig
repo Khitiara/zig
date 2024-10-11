@@ -195,7 +195,6 @@ job_queued_compiler_rt_obj: bool = false,
 job_queued_fuzzer_lib: bool = false,
 job_queued_update_builtin_zig: bool,
 alloc_failure_occurred: bool = false,
-formatted_panics: bool = false,
 last_update_was_cache_hit: bool = false,
 
 c_source_files: []const CSourceFile,
@@ -280,6 +279,13 @@ pub const SemaError = Zcu.SemaError;
 pub const CRTFile = struct {
     lock: Cache.Lock,
     full_object_path: []const u8,
+
+    pub fn isObject(cf: CRTFile) bool {
+        return switch (classifyFileExt(cf.full_object_path)) {
+            .object => true,
+            else => false,
+        };
+    }
 
     pub fn deinit(self: *CRTFile, gpa: Allocator) void {
         self.lock.release();
@@ -1019,6 +1025,13 @@ pub const LinkObject = struct {
     //
     // Consistent with `withLOption` variable name in lld ELF driver.
     loption: bool = false,
+
+    pub fn isObject(lo: LinkObject) bool {
+        return switch (classifyFileExt(lo.path)) {
+            .object => true,
+            else => false,
+        };
+    }
 };
 
 pub const CreateOptions = struct {
@@ -1088,7 +1101,6 @@ pub const CreateOptions = struct {
     /// executable this field is ignored.
     want_compiler_rt: ?bool = null,
     want_lto: ?bool = null,
-    formatted_panics: ?bool = null,
     function_sections: bool = false,
     data_sections: bool = false,
     no_builtin: bool = false,
@@ -1357,9 +1369,6 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             }
         }
 
-        // TODO: https://github.com/ziglang/zig/issues/17969
-        const formatted_panics = options.formatted_panics orelse (options.root_mod.optimize_mode == .Debug);
-
         const error_limit = options.error_limit orelse (std.math.maxInt(u16) - 1);
 
         // We put everything into the cache hash that *cannot be modified
@@ -1520,7 +1529,6 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             .verbose_link = options.verbose_link,
             .disable_c_depfile = options.disable_c_depfile,
             .reference_trace = options.reference_trace,
-            .formatted_panics = formatted_panics,
             .time_report = options.time_report,
             .stack_report = options.stack_report,
             .test_filters = options.test_filters,
@@ -1638,7 +1646,6 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
                 hash.addListOfBytes(options.test_filters);
                 hash.addOptionalBytes(options.test_name_prefix);
                 hash.add(options.skip_linker_dependencies);
-                hash.add(formatted_panics);
                 hash.add(options.emit_h != null);
                 hash.add(error_limit);
 
@@ -2440,7 +2447,7 @@ fn flush(
     if (comp.bin_file) |lf| {
         // This is needed before reading the error flags.
         lf.flush(arena, tid, prog_node) catch |err| switch (err) {
-            error.FlushFailure => {}, // error reported through link_error_flags
+            error.FlushFailure, error.LinkFailure => {}, // error reported through link_error_flags
             error.LLDReportedFailure => {}, // error reported via lockAndParseLldStderr
             else => |e| return e,
         };
@@ -2564,7 +2571,6 @@ fn addNonIncrementalStuffToCacheManifest(
         man.hash.addListOfBytes(comp.test_filters);
         man.hash.addOptionalBytes(comp.test_name_prefix);
         man.hash.add(comp.skip_linker_dependencies);
-        man.hash.add(comp.formatted_panics);
         //man.hash.add(mod.emit_h != null);
         man.hash.add(mod.error_limit);
     } else {
@@ -2639,7 +2645,7 @@ fn addNonIncrementalStuffToCacheManifest(
         const target = comp.root_mod.resolved_target.result;
         if (comp.libc_installation) |libc_installation| {
             man.hash.addOptionalBytes(libc_installation.crt_dir);
-            if (target.abi == .msvc) {
+            if (target.abi == .msvc or target.abi == .itanium) {
                 man.hash.addOptionalBytes(libc_installation.msvc_lib_dir);
                 man.hash.addOptionalBytes(libc_installation.kernel32_lib_dir);
             }

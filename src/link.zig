@@ -67,7 +67,6 @@ pub const File = struct {
     gc_sections: bool,
     print_gc_sections: bool,
     build_id: std.zig.BuildId,
-    rpath_list: []const []const u8,
     allow_shlib_undefined: bool,
     stack_size: u64,
 
@@ -534,7 +533,10 @@ pub const File = struct {
         FailedToEmit,
         FileSystem,
         FilesOpenedWithWrongFlags,
+        /// Indicates an error will be present in `Compilation.link_errors`.
         FlushFailure,
+        /// Indicates an error will be present in `Compilation.link_errors`.
+        LinkFailure,
         FunctionSignatureMismatch,
         GlobalTypeMismatch,
         HotSwapUnavailableOnHostOperatingSystem,
@@ -932,7 +934,6 @@ pub const File = struct {
                 .xcoff => @panic("TODO implement xcoff object format"),
                 .hex => @panic("TODO implement hex object format"),
                 .raw => @panic("TODO implement raw object format"),
-                .dxcontainer => @panic("TODO implement dxcontainer object format"),
             };
         }
 
