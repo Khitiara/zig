@@ -309,6 +309,7 @@ fn mainArgs(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
             .server = use_server,
         });
     } else if (mem.eql(u8, cmd, "fmt")) {
+        dev.check(.fmt_command);
         return @import("fmt.zig").run(gpa, arena, cmd_args);
     } else if (mem.eql(u8, cmd, "objcopy")) {
         return jitCmd(gpa, arena, cmd_args, .{
@@ -3831,16 +3832,13 @@ fn createModule(
                     create_module.opts.link_libcpp = true;
                     continue;
                 }
-                switch (target_util.classifyCompilerRtLibName(target, lib_name)) {
+                switch (target_util.classifyCompilerRtLibName(lib_name)) {
                     .none => {},
                     .only_libunwind, .both => {
                         create_module.opts.link_libunwind = true;
                         continue;
                     },
-                    .only_compiler_rt => {
-                        warn("ignoring superfluous library '{s}': this dependency is fulfilled instead by compiler-rt which zig unconditionally provides", .{lib_name});
-                        continue;
-                    },
+                    .only_compiler_rt => continue,
                 }
 
                 if (target.isMinGW()) {
@@ -5243,7 +5241,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                 std.debug.lockStdErr();
                 defer std.debug.unlockStdErr();
                 break :t child.spawnAndWait() catch |err| {
-                    fatal("unable to spawn {s}: {s}", .{ child_argv.items[0], @errorName(err) });
+                    fatal("failed to spawn build runner {s}: {s}", .{ child_argv.items[0], @errorName(err) });
                 };
             };
 
