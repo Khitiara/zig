@@ -70,8 +70,7 @@ pub fn nanoTimestamp() i128 {
         else => {
             if(@hasDecl(@import("root"), "nanoTimestamp"))
                 return @import("root").nanoTimestamp();
-            var ts: posix.timespec = undefined;
-            posix.clock_gettime(.REALTIME, &ts) catch |err| switch (err) {
+            const ts = posix.clock_gettime(.REALTIME) catch |err| switch (err) {
                 error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
             };
             return (@as(i128, ts.sec) * ns_per_s) + ts.nsec;
@@ -173,8 +172,7 @@ pub const Instant = struct {
             else => posix.CLOCK.MONOTONIC,
         };
 
-        var ts: posix.timespec = undefined;
-        posix.clock_gettime(clock_id, &ts) catch return error.Unsupported;
+        const ts = posix.clock_gettime(clock_id) catch return error.Unsupported;
         return .{ .timestamp = ts };
     }
 
