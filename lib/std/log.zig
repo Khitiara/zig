@@ -202,6 +202,10 @@ pub fn scoped(comptime scope: @Type(.enum_literal)) type {
         ) void {
             log(.debug, scope, format, args);
         }
+
+        pub inline fn enabled(comptime message_level: Level) bool {
+            return logEnabled(message_level, scope);
+        }
     };
 }
 
