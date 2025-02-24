@@ -54,6 +54,10 @@ pub fn FullPanic(comptime panicFn: fn ([]const u8, ?usize) noreturn) type {
                 @tagName(accessed), @tagName(active),
             });
         }
+        pub fn sliceCastLenRemainder(src_len: usize) noreturn {
+            @branchHint(.cold);
+            std.debug.panicExtra(@returnAddress(), "slice length '{d}' does not divide exactly into destination elements", .{src_len});
+        }
         pub fn reachedUnreachable() noreturn {
             @branchHint(.cold);
             call("reached unreachable code", @returnAddress());
@@ -292,7 +296,7 @@ pub fn dumpHexFallible(bytes: []const u8) !void {
 /// TODO multithreaded awareness
 pub fn dumpCurrentStackTrace(start_addr: ?usize) void {
     nosuspend {
-        if (builtin.target.isWasm()) {
+        if (builtin.target.cpu.arch.isWasm()) {
             if (native_os == .wasi) {
                 const stderr = io.getStdErr().writer();
                 stderr.print("Unable to dump stack trace: not implemented for Wasm\n", .{}) catch return;
@@ -380,7 +384,7 @@ pub inline fn getContext(context: *ThreadContext) bool {
 /// TODO multithreaded awareness
 pub fn dumpStackTraceFromBase(context: *ThreadContext) void {
     nosuspend {
-        if (builtin.target.isWasm()) {
+        if (builtin.target.cpu.arch.isWasm()) {
             if (native_os == .wasi) {
                 const stderr = io.getStdErr().writer();
                 stderr.print("Unable to dump stack trace: not implemented for Wasm\n", .{}) catch return;
@@ -478,7 +482,7 @@ pub fn captureStackTrace(first_address: ?usize, stack_trace: *std.builtin.StackT
 /// TODO multithreaded awareness
 pub fn dumpStackTrace(stack_trace: std.builtin.StackTrace) void {
     nosuspend {
-        if (builtin.target.isWasm()) {
+        if (builtin.target.cpu.arch.isWasm()) {
             if (native_os == .wasi) {
                 const stderr = io.getStdErr().writer();
                 stderr.print("Unable to dump stack trace: not implemented for Wasm\n", .{}) catch return;
@@ -611,7 +615,7 @@ pub fn defaultPanic(
                 // ExitData buffer must be allocated using boot_services.allocatePool (spec: page 220)
                 const exit_data: []u16 = uefi.raw_pool_allocator.alloc(u16, exit_msg.len + 1) catch @trap();
                 @memcpy(exit_data, exit_msg[0..exit_data.len]); // Includes null terminator.
-                _ = bs.exit(uefi.handle, .Aborted, exit_data.len, exit_data.ptr);
+                _ = bs.exit(uefi.handle, .aborted, exit_data.len, exit_data.ptr);
             }
             @trap();
         },
@@ -759,7 +763,7 @@ pub const StackIterator = struct {
     pub fn initWithContext(first_address: ?usize, debug_info: *SelfInfo, context: *posix.ucontext_t) !StackIterator {
         // The implementation of DWARF unwinding on aarch64-macos is not complete. However, Apple mandates that
         // the frame pointer register is always used, so on this platform we can safely use the FP-based unwinder.
-        if (builtin.target.isDarwin() and native_arch == .aarch64)
+        if (builtin.target.os.tag.isDarwin() and native_arch == .aarch64)
             return init(first_address, @truncate(context.mcontext.ss.fp));
 
         if (SelfInfo.supports_unwinding) {

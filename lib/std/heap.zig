@@ -9,11 +9,12 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 
 pub const ArenaAllocator = @import("heap/arena_allocator.zig").ArenaAllocator;
-pub const WasmAllocator = @import("heap/WasmAllocator.zig");
-pub const PageAllocator = @import("heap/PageAllocator.zig");
-pub const ThreadSafeAllocator = @import("heap/ThreadSafeAllocator.zig");
-pub const SbrkAllocator = @import("heap/sbrk_allocator.zig").SbrkAllocator;
+pub const SmpAllocator = @import("heap/SmpAllocator.zig");
 pub const FixedBufferAllocator = @import("heap/FixedBufferAllocator.zig");
+pub const PageAllocator = @import("heap/PageAllocator.zig");
+pub const SbrkAllocator = @import("heap/sbrk_allocator.zig").SbrkAllocator;
+pub const ThreadSafeAllocator = @import("heap/ThreadSafeAllocator.zig");
+pub const WasmAllocator = @import("heap/WasmAllocator.zig");
 
 pub const DebugAllocatorConfig = @import("heap/debug_allocator.zig").Config;
 pub const DebugAllocator = @import("heap/debug_allocator.zig").DebugAllocator;
@@ -347,7 +348,7 @@ pub const page_allocator: Allocator = if (@hasDecl(root, "os") and
     @hasDecl(root.os, "heap") and
     @hasDecl(root.os.heap, "page_allocator"))
     root.os.heap.page_allocator
-else if (builtin.target.isWasm()) .{
+else if (builtin.target.cpu.arch.isWasm()) .{
     .ptr = undefined,
     .vtable = &WasmAllocator.vtable,
 } else if (builtin.target.os.tag == .plan9) .{
@@ -356,6 +357,11 @@ else if (builtin.target.isWasm()) .{
 } else .{
     .ptr = undefined,
     .vtable = &PageAllocator.vtable,
+};
+
+pub const smp_allocator: Allocator = .{
+    .ptr = undefined,
+    .vtable = &SmpAllocator.vtable,
 };
 
 /// This allocator is fast, small, and specific to WebAssembly. In the future,
@@ -475,7 +481,7 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
     };
 }
 
-test "c_allocator" {
+test c_allocator {
     if (builtin.link_libc) {
         try testAllocator(c_allocator);
         try testAllocatorAligned(c_allocator);
@@ -484,17 +490,25 @@ test "c_allocator" {
     }
 }
 
-test "raw_c_allocator" {
+test raw_c_allocator {
     if (builtin.link_libc) {
         try testAllocator(raw_c_allocator);
     }
+}
+
+test smp_allocator {
+    if (builtin.single_threaded) return;
+    try testAllocator(smp_allocator);
+    try testAllocatorAligned(smp_allocator);
+    try testAllocatorLargeAlignment(smp_allocator);
+    try testAllocatorAlignedShrink(smp_allocator);
 }
 
 test PageAllocator {
     const allocator = page_allocator;
     try testAllocator(allocator);
     try testAllocatorAligned(allocator);
-    if (!builtin.target.isWasm()) {
+    if (!builtin.target.cpu.arch.isWasm()) {
         try testAllocatorLargeAlignment(allocator);
         try testAllocatorAlignedShrink(allocator);
     }
@@ -667,7 +681,7 @@ pub fn testAllocatorAlignedShrink(base_allocator: mem.Allocator) !void {
         try stuff_to_free.append(slice);
         slice = try allocator.alignedAlloc(u8, 16, alloc_size);
     }
-    while (stuff_to_free.popOrNull()) |item| {
+    while (stuff_to_free.pop()) |item| {
         allocator.free(item);
     }
     slice[0] = 0x12;
@@ -975,7 +989,9 @@ test {
     _ = GeneralPurposeAllocator;
     _ = FixedBufferAllocator;
     _ = ThreadSafeAllocator;
-    if (builtin.target.isWasm()) {
+    _ = SbrkAllocator;
+    if (builtin.target.cpu.arch.isWasm()) {
         _ = WasmAllocator;
     }
+    if (!builtin.single_threaded) _ = smp_allocator;
 }

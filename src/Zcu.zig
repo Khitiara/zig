@@ -276,6 +276,7 @@ pub const BuiltinDecl = enum {
     @"panic.outOfBounds",
     @"panic.startGreaterThanEnd",
     @"panic.inactiveUnionField",
+    @"panic.sliceCastLenRemainder",
     @"panic.reachedUnreachable",
     @"panic.unwrapNull",
     @"panic.castToNull",
@@ -352,6 +353,7 @@ pub const BuiltinDecl = enum {
             .@"panic.outOfBounds",
             .@"panic.startGreaterThanEnd",
             .@"panic.inactiveUnionField",
+            .@"panic.sliceCastLenRemainder",
             .@"panic.reachedUnreachable",
             .@"panic.unwrapNull",
             .@"panic.castToNull",
@@ -1496,8 +1498,8 @@ pub const SrcLoc = struct {
                     const case = tree.fullSwitchCase(case_node).?;
                     const is_special = (case.ast.values.len == 0) or
                         (case.ast.values.len == 1 and
-                        node_tags[case.ast.values[0]] == .identifier and
-                        mem.eql(u8, tree.tokenSlice(main_tokens[case.ast.values[0]]), "_"));
+                            node_tags[case.ast.values[0]] == .identifier and
+                            mem.eql(u8, tree.tokenSlice(main_tokens[case.ast.values[0]]), "_"));
                     if (!is_special) continue;
 
                     return tree.nodeToSpan(case_node);
@@ -1516,8 +1518,8 @@ pub const SrcLoc = struct {
                     const case = tree.fullSwitchCase(case_node).?;
                     const is_special = (case.ast.values.len == 0) or
                         (case.ast.values.len == 1 and
-                        node_tags[case.ast.values[0]] == .identifier and
-                        mem.eql(u8, tree.tokenSlice(main_tokens[case.ast.values[0]]), "_"));
+                            node_tags[case.ast.values[0]] == .identifier and
+                            mem.eql(u8, tree.tokenSlice(main_tokens[case.ast.values[0]]), "_"));
                     if (is_special) continue;
 
                     for (case.ast.values) |item_node| {
@@ -3130,7 +3132,7 @@ pub fn mapOldZirToNew(
         }
     }
 
-    while (match_stack.popOrNull()) |match_item| {
+    while (match_stack.pop()) |match_item| {
         // First, a check: if the number of captures of this type has changed, we can't map it, because
         // we wouldn't know how to correlate type information with the last update.
         // Synchronizes with logic in `Zcu.PerThread.recreateStructType` etc.
@@ -3412,7 +3414,7 @@ pub fn addUnitReference(zcu: *Zcu, src_unit: AnalUnit, referenced_unit: AnalUnit
 
     try zcu.reference_table.ensureUnusedCapacity(gpa, 1);
 
-    const ref_idx = zcu.free_references.popOrNull() orelse idx: {
+    const ref_idx = zcu.free_references.pop() orelse idx: {
         _ = try zcu.all_references.addOne(gpa);
         break :idx zcu.all_references.items.len - 1;
     };
@@ -3437,7 +3439,7 @@ pub fn addTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPo
 
     try zcu.type_reference_table.ensureUnusedCapacity(gpa, 1);
 
-    const ref_idx = zcu.free_type_references.popOrNull() orelse idx: {
+    const ref_idx = zcu.free_type_references.pop() orelse idx: {
         _ = try zcu.all_type_references.addOne(gpa);
         break :idx zcu.all_type_references.items.len - 1;
     };
@@ -3594,7 +3596,6 @@ pub fn atomicPtrAlignment(
     const max_atomic_bits: u16 = switch (target.cpu.arch) {
         .avr,
         .msp430,
-        .spu_2,
         => 16,
 
         .arc,
@@ -3620,8 +3621,7 @@ pub fn atomicPtrAlignment(
         .spirv32,
         .loongarch32,
         .xtensa,
-        .propeller1,
-        .propeller2,
+        .propeller,
         => 32,
 
         .amdgcn,
@@ -3797,7 +3797,7 @@ fn resolveReferencesInner(zcu: *Zcu) !std.AutoHashMapUnmanaged(AnalUnit, ?Resolv
     }
 
     while (true) {
-        if (type_queue.popOrNull()) |kv| {
+        if (type_queue.pop()) |kv| {
             const ty = kv.key;
             const referencer = kv.value;
             try checked_types.putNoClobber(gpa, ty, {});
@@ -3920,7 +3920,7 @@ fn resolveReferencesInner(zcu: *Zcu) !std.AutoHashMapUnmanaged(AnalUnit, ?Resolv
             }
             continue;
         }
-        if (unit_queue.popOrNull()) |kv| {
+        if (unit_queue.pop()) |kv| {
             const unit = kv.key;
             try result.putNoClobber(gpa, unit, kv.value);
 
@@ -4211,9 +4211,7 @@ pub fn callconvSupported(zcu: *Zcu, cc: std.builtin.CallingConvention) union(enu
                 => |opts| opts.incoming_stack_alignment == null,
 
                 .arm_aapcs_vfp,
-                => |opts| opts.incoming_stack_alignment == null and target.os.tag != .watchos,
-                .arm_aapcs16_vfp,
-                => |opts| opts.incoming_stack_alignment == null and target.os.tag == .watchos,
+                => |opts| opts.incoming_stack_alignment == null,
 
                 .arm_interrupt,
                 => |opts| opts.incoming_stack_alignment == null,
@@ -4241,7 +4239,7 @@ pub fn callconvSupported(zcu: *Zcu, cc: std.builtin.CallingConvention) union(enu
             };
         },
         .stage2_wasm => switch (cc) {
-            .wasm_watc => |opts| opts.incoming_stack_alignment == null,
+            .wasm_mvp => |opts| opts.incoming_stack_alignment == null,
             else => false,
         },
         .stage2_arm => switch (cc) {

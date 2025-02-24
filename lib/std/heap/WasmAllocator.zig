@@ -1,5 +1,3 @@
-//! This is intended to be merged into GeneralPurposeAllocator at some point.
-
 const std = @import("../std.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -9,7 +7,7 @@ const wasm = std.wasm;
 const math = std.math;
 
 comptime {
-    if (!builtin.target.isWasm()) {
+    if (!builtin.target.cpu.arch.isWasm()) {
         @compileError("only available for wasm32 arch");
     }
     if (!builtin.single_threaded) {

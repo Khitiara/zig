@@ -39,10 +39,7 @@ test {
     _ = Package;
 }
 
-const thread_stack_size = switch (builtin.zig_backend) {
-    else => std.Thread.SpawnConfig.default_stack_size,
-    .stage2_x86_64 => 32 << 20,
-};
+const thread_stack_size = 32 << 20;
 
 pub const std_options: std.Options = .{
     .wasiCwd = wasi_cwd,
@@ -171,30 +168,31 @@ pub fn log(
     std.debug.print(prefix1 ++ prefix2 ++ format ++ "\n", args);
 }
 
-var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{
+var debug_allocator: std.heap.DebugAllocator(.{
     .stack_trace_frames = build_options.mem_leak_frames,
-}){};
+}) = .init;
 
 pub fn main() anyerror!void {
     crash_report.initialize();
 
-    const use_gpa = (build_options.force_gpa or !builtin.link_libc) and native_os != .wasi;
-    const gpa = gpa: {
-        if (native_os == .wasi) {
-            break :gpa std.heap.wasm_allocator;
+    const gpa, const is_debug = gpa: {
+        if (build_options.debug_gpa) break :gpa .{ debug_allocator.allocator(), true };
+        if (native_os == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
+        if (builtin.link_libc) {
+            // We would prefer to use raw libc allocator here, but cannot use
+            // it if it won't support the alignment we need.
+            if (@alignOf(std.c.max_align_t) < @max(@alignOf(i128), std.atomic.cache_line)) {
+                break :gpa .{ std.heap.c_allocator, false };
+            }
+            break :gpa .{ std.heap.raw_c_allocator, false };
         }
-        if (use_gpa) {
-            break :gpa general_purpose_allocator.allocator();
-        }
-        // We would prefer to use raw libc allocator here, but cannot
-        // use it if it won't support the alignment we need.
-        if (@alignOf(std.c.max_align_t) < @max(@alignOf(i128), std.atomic.cache_line)) {
-            break :gpa std.heap.c_allocator;
-        }
-        break :gpa std.heap.raw_c_allocator;
+        break :gpa switch (builtin.mode) {
+            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
+            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
+        };
     };
-    defer if (use_gpa) {
-        _ = general_purpose_allocator.deinit();
+    defer if (is_debug) {
+        _ = debug_allocator.deinit();
     };
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
@@ -920,6 +918,7 @@ fn buildOutputType(
     var headerpad_max_install_names: bool = false;
     var dead_strip_dylibs: bool = false;
     var force_load_objc: bool = false;
+    var discard_local_symbols: bool = false;
     var contains_res_file: bool = false;
     var reference_trace: ?u32 = null;
     var pdb_out_path: ?[]const u8 = null;
@@ -1153,6 +1152,8 @@ fn buildOutputType(
                         entry = .{ .named = arg["-fentry=".len..] };
                     } else if (mem.eql(u8, arg, "--force_undefined")) {
                         try force_undefined_symbols.put(arena, args_iter.nextOrFatal(), {});
+                    } else if (mem.eql(u8, arg, "--discard-all")) {
+                        discard_local_symbols = true;
                     } else if (mem.eql(u8, arg, "--stack")) {
                         stack_size = parseStackSize(args_iter.nextOrFatal());
                     } else if (mem.eql(u8, arg, "--image-base")) {
@@ -2512,6 +2513,8 @@ fn buildOutputType(
                     entry = .{ .named = linker_args_it.nextOrFatal() };
                 } else if (mem.eql(u8, arg, "-u")) {
                     try force_undefined_symbols.put(arena, linker_args_it.nextOrFatal(), {});
+                } else if (mem.eql(u8, arg, "-x") or mem.eql(u8, arg, "--discard-all")) {
+                    discard_local_symbols = true;
                 } else if (mem.eql(u8, arg, "--stack") or mem.eql(u8, arg, "-stack_size")) {
                     stack_size = parseStackSize(linker_args_it.nextOrFatal());
                 } else if (mem.eql(u8, arg, "--image-base")) {
@@ -3581,6 +3584,7 @@ fn buildOutputType(
         .headerpad_max_install_names = headerpad_max_install_names,
         .dead_strip_dylibs = dead_strip_dylibs,
         .force_load_objc = force_load_objc,
+        .discard_local_symbols = discard_local_symbols,
         .reference_trace = reference_trace,
         .pdb_out_path = pdb_out_path,
         .error_limit = error_limit,
@@ -3985,7 +3989,7 @@ fn createModule(
         }
         create_module.lib_dir_args = undefined; // From here we use lib_directories instead.
 
-        if (resolved_target.is_native_os and target.isDarwin()) {
+        if (resolved_target.is_native_os and target.os.tag.isDarwin()) {
             // If we want to link against frameworks, we need system headers.
             if (create_module.frameworks.count() > 0)
                 create_module.want_native_include_dirs = true;
@@ -5915,8 +5919,8 @@ pub const ClangArgIterator = struct {
 
             self.arg_iterator_response_file =
                 initArgIteratorResponseFile(arena, resp_file_path) catch |err| {
-                fatal("unable to read response file '{s}': {s}", .{ resp_file_path, @errorName(err) });
-            };
+                    fatal("unable to read response file '{s}': {s}", .{ resp_file_path, @errorName(err) });
+                };
             // NOTE: The ArgIteratorResponseFile returns tokens from next() that are slices of an
             // internal buffer. This internal buffer is arena allocated, so it is not cleaned up here.
 
@@ -6229,8 +6233,8 @@ fn cmdAstCheck(
                     file.tree.?.tokens.len * (@sizeOf(std.zig.Token.Tag) + @sizeOf(Ast.ByteOffset));
                 const tree_bytes = @sizeOf(Ast) + file.tree.?.nodes.len *
                     (@sizeOf(Ast.Node.Tag) +
-                    @sizeOf(Ast.Node.Data) +
-                    @sizeOf(Ast.TokenIndex));
+                        @sizeOf(Ast.Node.Data) +
+                        @sizeOf(Ast.TokenIndex));
                 const instruction_bytes = file.zir.?.instructions.len *
                     // Here we don't use @sizeOf(Zir.Inst.Data) because it would include
                     // the debug safety tag but we want to measure release size.
@@ -6955,6 +6959,16 @@ const usage_fetch =
     \\Usage: zig fetch [options] <path>
     \\
     \\    Copy a package into the global cache and print its hash.
+    \\    <url> must point to one of the following:
+    \\      - A git+http / git+https server for the package
+    \\      - A tarball file (with or without compression) containing
+    \\        package source
+    \\      - A git bundle file containing package source
+    \\
+    \\Examples:
+    \\
+    \\  zig fetch --save git+https://example.com/andrewrk/fun-example-tool.git
+    \\  zig fetch --save https://example.com/andrewrk/fun-example-tool/archive/refs/heads/master.tar.gz
     \\
     \\Options:
     \\  -h, --help                    Print this help and exit

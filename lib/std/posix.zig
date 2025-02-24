@@ -775,7 +775,7 @@ pub fn exit(status: u8) noreturn {
             _ = bs.exit(uefi.handle, @enumFromInt(status), 0, null);
         }
         // If we can't exit, reboot the system instead.
-        uefi.system_table.runtime_services.resetSystem(.ResetCold, @enumFromInt(status), 0, null);
+        uefi.system_table.runtime_services.resetSystem(.reset_cold, @enumFromInt(status), 0, null);
     }
     system.exit(status);
 }
@@ -1056,6 +1056,7 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
             .SUCCESS => return,
             .INVALID_HANDLE => unreachable, // Handle not open for writing
             .ACCESS_DENIED => return error.AccessDenied,
+            .USER_MAPPED_FILE => return error.AccessDenied,
             else => return windows.unexpectedStatus(rc),
         }
     }
@@ -2104,7 +2105,7 @@ pub fn symlink(target_path: []const u8, sym_link_path: []const u8) SymLinkError!
     if (native_os == .windows) {
         @compileError("symlink is not supported on Windows; use std.os.windows.CreateSymbolicLink instead");
     } else if (native_os == .wasi and !builtin.link_libc) {
-        return symlinkat(target_path, wasi.AT.FDCWD, sym_link_path);
+        return symlinkat(target_path, AT.FDCWD, sym_link_path);
     }
     const target_path_c = try toPosixPath(target_path);
     const sym_link_path_c = try toPosixPath(sym_link_path);
@@ -2274,7 +2275,7 @@ pub fn linkZ(oldpath: [*:0]const u8, newpath: [*:0]const u8) LinkError!void {
 /// On other platforms, both paths are an opaque sequence of bytes with no particular encoding.
 pub fn link(oldpath: []const u8, newpath: []const u8) LinkError!void {
     if (native_os == .wasi and !builtin.link_libc) {
-        return linkat(wasi.AT.FDCWD, oldpath, wasi.AT.FDCWD, newpath, 0) catch |err| switch (err) {
+        return linkat(AT.FDCWD, oldpath, AT.FDCWD, newpath, 0) catch |err| switch (err) {
             error.NotDir => unreachable, // link() does not support directories
             else => |e| return e,
         };
@@ -2411,7 +2412,7 @@ pub const UnlinkError = error{
 /// See also `unlinkZ`.
 pub fn unlink(file_path: []const u8) UnlinkError!void {
     if (native_os == .wasi and !builtin.link_libc) {
-        return unlinkat(wasi.AT.FDCWD, file_path, 0) catch |err| switch (err) {
+        return unlinkat(AT.FDCWD, file_path, 0) catch |err| switch (err) {
             error.DirNotEmpty => unreachable, // only occurs when targeting directories
             else => |e| return e,
         };
@@ -2605,7 +2606,7 @@ pub const RenameError = error{
 /// On other platforms, both paths are an opaque sequence of bytes with no particular encoding.
 pub fn rename(old_path: []const u8, new_path: []const u8) RenameError!void {
     if (native_os == .wasi and !builtin.link_libc) {
-        return renameat(wasi.AT.FDCWD, old_path, wasi.AT.FDCWD, new_path);
+        return renameat(AT.FDCWD, old_path, AT.FDCWD, new_path);
     } else if (native_os == .windows) {
         const old_path_w = try windows.sliceToPrefixedFileW(null, old_path);
         const new_path_w = try windows.sliceToPrefixedFileW(null, new_path);
@@ -2851,12 +2852,12 @@ pub fn renameatW(
 
         rc =
             windows.ntdll.NtSetInformationFile(
-            src_fd,
-            &io_status_block,
-            rename_info,
-            @intCast(struct_len), // already checked for error.NameTooLong
-            .FileRenameInformation,
-        );
+                src_fd,
+                &io_status_block,
+                rename_info,
+                @intCast(struct_len), // already checked for error.NameTooLong
+                .FileRenameInformation,
+            );
     }
 
     switch (rc) {
@@ -3000,7 +3001,7 @@ pub const MakeDirError = error{
 /// On other platforms, `dir_path` is an opaque sequence of bytes with no particular encoding.
 pub fn mkdir(dir_path: []const u8, mode: mode_t) MakeDirError!void {
     if (native_os == .wasi and !builtin.link_libc) {
-        return mkdirat(wasi.AT.FDCWD, dir_path, mode);
+        return mkdirat(AT.FDCWD, dir_path, mode);
     } else if (native_os == .windows) {
         const dir_path_w = try windows.sliceToPrefixedFileW(null, dir_path);
         return mkdirW(dir_path_w.span(), mode);
@@ -3089,7 +3090,7 @@ pub const DeleteDirError = error{
 /// On other platforms, `dir_path` is an opaque sequence of bytes with no particular encoding.
 pub fn rmdir(dir_path: []const u8) DeleteDirError!void {
     if (native_os == .wasi and !builtin.link_libc) {
-        return unlinkat(wasi.AT.FDCWD, dir_path, AT.REMOVEDIR) catch |err| switch (err) {
+        return unlinkat(AT.FDCWD, dir_path, AT.REMOVEDIR) catch |err| switch (err) {
             error.FileSystem => unreachable, // only occurs when targeting files
             error.IsDir => unreachable, // only occurs when targeting files
             else => |e| return e,
@@ -3278,7 +3279,7 @@ pub const ReadLinkError = error{
 /// On other platforms, the result is an opaque sequence of bytes with no particular encoding.
 pub fn readlink(file_path: []const u8, out_buffer: []u8) ReadLinkError![]u8 {
     if (native_os == .wasi and !builtin.link_libc) {
-        return readlinkat(wasi.AT.FDCWD, file_path, out_buffer);
+        return readlinkat(AT.FDCWD, file_path, out_buffer);
     } else if (native_os == .windows) {
         const file_path_w = try windows.sliceToPrefixedFileW(null, file_path);
         return readlinkW(file_path_w.span(), out_buffer);
@@ -3583,7 +3584,7 @@ pub fn socket(domain: u32, socket_type: u32, protocol: u32) SocketError!socket_t
         return rc;
     }
 
-    const have_sock_flags = !builtin.target.isDarwin() and native_os != .haiku;
+    const have_sock_flags = !builtin.target.os.tag.isDarwin() and native_os != .haiku;
     const filtered_sock_type = if (!have_sock_flags)
         socket_type & ~@as(u32, SOCK.NONBLOCK | SOCK.CLOEXEC)
     else
@@ -3879,7 +3880,7 @@ pub fn accept(
     ///   description  of the `CLOEXEC` flag in `open` for reasons why this may be useful.
     flags: u32,
 ) AcceptError!socket_t {
-    const have_accept4 = !(builtin.target.isDarwin() or native_os == .windows or native_os == .haiku);
+    const have_accept4 = !(builtin.target.os.tag.isDarwin() or native_os == .windows or native_os == .haiku);
     assert(0 == (flags & ~@as(u32, SOCK.NONBLOCK | SOCK.CLOEXEC))); // Unsupported flag(s)
 
     const accepted_sock: socket_t = while (true) {
@@ -4753,6 +4754,9 @@ pub const MMapError = error{
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
     OutOfMemory,
+
+    /// Using FIXED_NOREPLACE flag and the process has already mapped memory at the given address
+    MappingAlreadyExists,
 } || UnexpectedError;
 
 /// Map files or devices into memory.
@@ -4791,6 +4795,7 @@ pub fn mmap(
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.OutOfMemory,
+        .EXIST => return error.MappingAlreadyExists,
         else => return unexpectedErrno(err),
     }
 }
@@ -4893,7 +4898,7 @@ pub fn access(path: []const u8, mode: u32) AccessError!void {
         _ = try windows.GetFileAttributesW(path_w.span().ptr);
         return;
     } else if (native_os == .wasi and !builtin.link_libc) {
-        return faccessat(wasi.AT.FDCWD, path, mode, 0);
+        return faccessat(AT.FDCWD, path, mode, 0);
     }
     const path_c = try toPosixPath(path);
     return accessZ(&path_c, mode);
@@ -4914,6 +4919,7 @@ pub fn accessZ(path: [*:0]const u8, mode: u32) AccessError!void {
     switch (errno(system.access(path, mode))) {
         .SUCCESS => return,
         .ACCES => return error.PermissionDenied,
+        .PERM => return error.PermissionDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .LOOP => return error.SymLinkLoop,
         .TXTBSY => return error.FileBusy,
@@ -4999,6 +5005,7 @@ pub fn faccessatZ(dirfd: fd_t, path: [*:0]const u8, mode: u32, flags: u32) Acces
     switch (errno(system.faccessat(dirfd, path, mode, flags))) {
         .SUCCESS => return,
         .ACCES => return error.PermissionDenied,
+        .PERM => return error.PermissionDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .LOOP => return error.SymLinkLoop,
         .TXTBSY => return error.FileBusy,
@@ -5143,10 +5150,10 @@ pub fn sysctl(
     newlen: usize,
 ) SysCtlError!void {
     if (native_os == .wasi) {
-        @panic("unsupported"); // TODO should be compile error, not panic
+        @compileError("sysctl not supported on WASI");
     }
     if (native_os == .haiku) {
-        @panic("unsupported"); // TODO should be compile error, not panic
+        @compileError("sysctl not supported on Haiku");
     }
 
     const name_len = cast(c_uint, name.len) orelse return error.NameTooLong;
@@ -5168,10 +5175,10 @@ pub fn sysctlbynameZ(
     newlen: usize,
 ) SysCtlError!void {
     if (native_os == .wasi) {
-        @panic("unsupported"); // TODO should be compile error, not panic
+        @compileError("sysctl not supported on WASI");
     }
     if (native_os == .haiku) {
-        @panic("unsupported"); // TODO should be compile error, not panic
+        @compileError("sysctl not supported on Haiku");
     }
 
     switch (errno(system.sysctlbyname(name, oldp, oldlenp, newp, newlen))) {
@@ -5693,7 +5700,10 @@ pub const ClockGetTimeError = error{UnsupportedClock} || UnexpectedError;
 
 pub fn clock_gettime(clock_id: clockid_t) ClockGetTimeError!timespec {
     var tp: timespec = undefined;
-    if (native_os == .wasi and !builtin.link_libc) {
+
+    if (native_os == .windows) {
+        @compileError("Windows does not support POSIX; use Windows-specific API or cross-platform std.time API");
+    } else if (native_os == .wasi and !builtin.link_libc) {
         var ts: timestamp_t = undefined;
         switch (system.clock_time_get(clock_id, 1, &ts)) {
             .SUCCESS => {
@@ -5706,23 +5716,6 @@ pub fn clock_gettime(clock_id: clockid_t) ClockGetTimeError!timespec {
             else => |err| return unexpectedErrno(err),
         }
         return tp;
-    }
-    if (native_os == .windows) {
-        if (clock_id == .REALTIME) {
-            var ft: windows.FILETIME = undefined;
-            windows.kernel32.GetSystemTimeAsFileTime(&ft);
-            // FileTime has a granularity of 100 nanoseconds and uses the NTFS/Windows epoch.
-            const ft64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            const ft_per_s = std.time.ns_per_s / 100;
-            tp = .{
-                .sec = @as(i64, @intCast(ft64 / ft_per_s)) + std.time.epoch.windows,
-                .nsec = @as(c_long, @intCast(ft64 % ft_per_s)) * 100,
-            };
-            return tp;
-        } else {
-            // TODO POSIX implementation of CLOCK.MONOTONIC on Windows.
-            return error.UnsupportedClock;
-        }
     }
 
     switch (errno(system.clock_gettime(clock_id, &tp))) {

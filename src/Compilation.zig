@@ -657,7 +657,7 @@ pub const CObject = struct {
                     .end_block => |block| switch (@as(BlockId, @enumFromInt(block.id))) {
                         .Meta => {},
                         .Diag => {
-                            var wip_diag = stack.pop();
+                            var wip_diag = stack.pop().?;
                             errdefer wip_diag.deinit(gpa);
 
                             const src_ranges = try wip_diag.src_ranges.toOwnedSlice(gpa);
@@ -1160,6 +1160,8 @@ pub const CreateOptions = struct {
     dead_strip_dylibs: bool = false,
     /// (Darwin) Force load all members of static archives that implement an Objective-C class or category
     force_load_objc: bool = false,
+    /// Whether local symbols should be discarded from the symbol table.
+    discard_local_symbols: bool = false,
     libcxx_abi_version: libcxx.AbiVersion = libcxx.AbiVersion.default,
     /// (Windows) PDB source path prefix to instruct the linker how to resolve relative
     /// paths when consolidating CodeView streams into a single PDB file.
@@ -1585,6 +1587,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             .headerpad_max_install_names = options.headerpad_max_install_names,
             .dead_strip_dylibs = options.dead_strip_dylibs,
             .force_load_objc = options.force_load_objc,
+            .discard_local_symbols = options.discard_local_symbols,
             .pdb_source_path = options.pdb_source_path,
             .pdb_out_path = options.pdb_out_path,
             .entry_addr = null, // CLI does not expose this option (yet?)
@@ -1766,11 +1769,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             if (comp.config.link_libc and is_exe_or_dyn_lib) {
                 // If the "is darwin" check is moved below the libc_installation check below,
                 // error.LibCInstallationMissingCrtDir is returned from lci.resolveCrtPaths().
-                if (target.isDarwin()) {
-                    switch (target.abi) {
-                        .none, .simulator, .macabi => {},
-                        else => return error.LibCUnavailable,
-                    }
+                if (target.isDarwinLibC()) {
                     // TODO delete logic from MachO flush() and queue up tasks here instead.
                 } else if (comp.libc_installation) |lci| {
                     const basenames = LibCInstallation.CrtBasenames.get(.{
@@ -1793,7 +1792,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
                     // Loads the libraries provided by `target_util.libcFullLinkFlags(target)`.
                     comp.link_task_queue.shared.appendAssumeCapacity(.load_host_libc);
                     comp.remaining_prelink_tasks += 1;
-                } else if (target.isMusl() and !target.isWasm()) {
+                } else if (target.isMuslLibC()) {
                     if (!std.zig.target.canBuildLibC(target)) return error.LibCUnavailable;
 
                     if (musl.needsCrt0(comp.config.output_mode, comp.config.link_mode, comp.config.pie)) |f| {
@@ -1817,7 +1816,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
 
                     comp.queued_jobs.glibc_crt_file[@intFromEnum(glibc.CrtFile.libc_nonshared_a)] = true;
                     comp.remaining_prelink_tasks += 1;
-                } else if (target.isWasm() and target.os.tag == .wasi) {
+                } else if (target.isWasiLibC()) {
                     if (!std.zig.target.canBuildLibC(target)) return error.LibCUnavailable;
 
                     for (comp.wasi_emulated_libs) |crt_file| {
@@ -1839,11 +1838,6 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
                     // When linking mingw-w64 there are some import libs we always need.
                     try comp.windows_libs.ensureUnusedCapacity(gpa, mingw.always_link_libs.len);
                     for (mingw.always_link_libs) |name| comp.windows_libs.putAssumeCapacity(name, {});
-                } else if (target.isDarwin()) {
-                    switch (target.abi) {
-                        .none, .simulator, .macabi => {},
-                        else => return error.LibCUnavailable,
-                    }
                 } else if (target.os.tag == .freestanding and capable_of_building_zig_libc) {
                     comp.queued_jobs.zig_libc = true;
                     comp.remaining_prelink_tasks += 1;
@@ -2674,6 +2668,7 @@ fn addNonIncrementalStuffToCacheManifest(
     man.hash.add(opts.headerpad_max_install_names);
     man.hash.add(opts.dead_strip_dylibs);
     man.hash.add(opts.force_load_objc);
+    man.hash.add(opts.discard_local_symbols);
 
     // COFF specific stuff
     man.hash.addOptional(opts.subsystem);
@@ -5545,7 +5540,7 @@ pub fn addCCArgs(
 
     // We might want to support -mfloat-abi=softfp for Arm and CSKY here in the future.
     if (target_util.clangSupportsFloatAbiArg(target)) {
-        const fabi = @tagName(target.floatAbi());
+        const fabi = @tagName(target.abi.float());
 
         try argv.append(switch (target.cpu.arch) {
             // For whatever reason, Clang doesn't support `-mfloat-abi` for s390x.
@@ -5598,7 +5593,7 @@ pub fn addCCArgs(
     if (ext != .assembly) {
         try argv.append(if (target.os.tag == .freestanding) "-ffreestanding" else "-fhosted");
 
-        if (target_util.clangSupportsNoImplicitFloatArg(target) and target.floatAbi() == .soft) {
+        if (target_util.clangSupportsNoImplicitFloatArg(target) and target.abi.float() == .soft) {
             try argv.append("-mno-implicit-float");
         }
 
@@ -5646,7 +5641,7 @@ pub fn addCCArgs(
         // LLVM IR files don't support these flags.
         if (ext != .ll and ext != .bc) {
             // https://github.com/llvm/llvm-project/issues/105972
-            if (target.cpu.arch.isPowerPC() and target.floatAbi() == .soft) {
+            if (target.cpu.arch.isPowerPC() and target.abi.float() == .soft) {
                 try argv.append("-D__NO_FPRS__");
                 try argv.append("-D_SOFT_FLOAT");
                 try argv.append("-D_SOFT_DOUBLE");
@@ -5915,7 +5910,7 @@ pub fn addCCArgs(
                     try san_arg.appendSlice(arena, "fuzzer-no-link,");
                 }
                 // Chop off the trailing comma and append to argv.
-                if (san_arg.popOrNull()) |_| {
+                if (san_arg.pop()) |_| {
                     try argv.append(san_arg.items);
 
                     // These args have to be added after the `-fsanitize` arg or
@@ -5931,10 +5926,10 @@ pub fn addCCArgs(
                         // function was called.
                         try argv.append("-fno-sanitize=function");
                     }
+                }
 
-                    if (comp.config.san_cov_trace_pc_guard) {
-                        try argv.appendSlice(&.{ "-Xclang", "-fsanitize-coverage-trace-pc-guard" });
-                    }
+                if (comp.config.san_cov_trace_pc_guard) {
+                    try argv.append("-fsanitize-coverage=trace-pc-guard");
                 }
             }
 
@@ -6500,6 +6495,8 @@ fn buildOutputFromZig(
         .root_strip = strip,
         .link_libc = comp.config.link_libc,
         .any_unwind_tables = comp.root_mod.unwind_tables != .none,
+        .any_error_tracing = false,
+        .root_error_tracing = false,
         .lto = if (allow_lto) comp.config.lto else .none,
     });
 
@@ -6523,6 +6520,7 @@ fn buildOutputFromZig(
             .structured_cfg = comp.root_mod.structured_cfg,
             .no_builtin = true,
             .code_model = comp.root_mod.code_model,
+            .error_tracing = false,
         },
         .global = config,
         .cc_argv = &.{},

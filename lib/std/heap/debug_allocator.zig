@@ -90,11 +90,16 @@ const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const StackTrace = std.builtin.StackTrace;
 
-const default_page_size: usize = @max(std.heap.page_size_max, switch (builtin.os.tag) {
-    .windows => 64 * 1024, // Makes `std.heap.PageAllocator` take the happy path.
-    .wasi => 64 * 1024, // Max alignment supported by `std.heap.WasmAllocator`.
-    else => 128 * 1024, // Avoids too many active mappings when `page_size_max` is low.
-});
+const default_page_size: usize = switch (builtin.os.tag) {
+    // Makes `std.heap.PageAllocator` take the happy path.
+    .windows => 64 * 1024,
+    else => switch (builtin.cpu.arch) {
+        // Max alignment supported by `std.heap.WasmAllocator`.
+        .wasm32, .wasm64 => 64 * 1024,
+        // Avoids too many active mappings when `page_size_max` is low.
+        else => @max(std.heap.page_size_max, 128 * 1024),
+    },
+};
 
 const Log2USize = std.math.Log2Int(usize);
 
@@ -851,8 +856,6 @@ pub fn DebugAllocator(comptime config: Config) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            assert(old_memory.len != 0);
-
             const size_class_index: usize = @max(@bitSizeOf(usize) - @clz(old_memory.len - 1), @intFromEnum(alignment));
             if (size_class_index >= self.buckets.len) {
                 @branchHint(.unlikely);
@@ -1072,7 +1075,7 @@ test "small allocations - free in reverse order" {
         try list.append(ptr);
     }
 
-    while (list.popOrNull()) |ptr| {
+    while (list.pop()) |ptr| {
         allocator.destroy(ptr);
     }
 }
@@ -1142,7 +1145,7 @@ test "shrink" {
 }
 
 test "large object - grow" {
-    if (builtin.target.isWasm()) {
+    if (builtin.target.cpu.arch.isWasm()) {
         // Not expected to pass on targets that do not have memory mapping.
         return error.SkipZigTest;
     }
@@ -1229,7 +1232,7 @@ test "shrink large object to large object with larger alignment" {
         try stuff_to_free.append(slice);
         slice = try allocator.alignedAlloc(u8, 16, alloc_size);
     }
-    while (stuff_to_free.popOrNull()) |item| {
+    while (stuff_to_free.pop()) |item| {
         allocator.free(item);
     }
     slice[0] = 0x12;
@@ -1301,7 +1304,7 @@ test "realloc large object to larger alignment" {
         try stuff_to_free.append(slice);
         slice = try allocator.alignedAlloc(u8, 16, default_page_size * 2 + 50);
     }
-    while (stuff_to_free.popOrNull()) |item| {
+    while (stuff_to_free.pop()) |item| {
         allocator.free(item);
     }
     slice[0] = 0x12;
@@ -1321,7 +1324,7 @@ test "realloc large object to larger alignment" {
 }
 
 test "large object rejects shrinking to small" {
-    if (builtin.target.isWasm()) {
+    if (builtin.target.cpu.arch.isWasm()) {
         // Not expected to pass on targets that do not have memory mapping.
         return error.SkipZigTest;
     }
