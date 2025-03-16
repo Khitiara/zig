@@ -600,6 +600,20 @@ pub const File = struct {
         }
     }
 
+    /// Some linkers create a separate file for debug info, which we might need to temporarily close
+    /// when moving the compilation result directory due to the host OS not allowing moving a
+    /// file/directory while a handle remains open.
+    /// Returns `true` if a debug info file was closed. In that case, `reopenDebugInfo` may be called.
+    pub fn closeDebugInfo(base: *File) bool {
+        const macho = base.cast(.macho) orelse return false;
+        return macho.closeDebugInfo();
+    }
+
+    pub fn reopenDebugInfo(base: *File) !void {
+        const macho = base.cast(.macho).?;
+        return macho.reopenDebugInfo();
+    }
+
     pub fn makeExecutable(base: *File) !void {
         dev.check(.make_executable);
         const comp = base.comp;
@@ -1102,8 +1116,13 @@ pub const File = struct {
 
         log.debug("zcu_obj_path={s}", .{if (zcu_obj_path) |s| s else "(null)"});
 
-        const compiler_rt_path: ?Path = if (comp.include_compiler_rt)
+        const compiler_rt_path: ?Path = if (comp.compiler_rt_strat == .obj)
             comp.compiler_rt_obj.?.full_object_path
+        else
+            null;
+
+        const ubsan_rt_path: ?Path = if (comp.ubsan_rt_strat == .obj)
+            comp.ubsan_rt_obj.?.full_object_path
         else
             null;
 
@@ -1136,6 +1155,7 @@ pub const File = struct {
             }
             try man.addOptionalFile(zcu_obj_path);
             try man.addOptionalFilePath(compiler_rt_path);
+            try man.addOptionalFilePath(ubsan_rt_path);
 
             // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
             _ = try man.hit();
@@ -1181,6 +1201,7 @@ pub const File = struct {
         }
         if (zcu_obj_path) |p| object_files.appendAssumeCapacity(try arena.dupeZ(u8, p));
         if (compiler_rt_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
+        if (ubsan_rt_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
 
         if (comp.verbose_link) {
             std.debug.print("ar rcs {s}", .{full_out_path_z});

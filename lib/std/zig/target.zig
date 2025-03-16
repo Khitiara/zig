@@ -242,6 +242,8 @@ pub fn isLibCLibName(target: std.Target, name: []const u8) bool {
             return true;
         if (eqlIgnoreCase(ignore_case, name, "wbemuuid"))
             return true;
+        if (eqlIgnoreCase(ignore_case, name, "wiaguid"))
+            return true;
         if (eqlIgnoreCase(ignore_case, name, "winpthread"))
             return true;
         if (eqlIgnoreCase(ignore_case, name, "wmcodecdspuuid"))
@@ -313,6 +315,17 @@ pub fn isLibCLibName(target: std.Target, name: []const u8) bool {
         if (eqlIgnoreCase(ignore_case, name, "root"))
             return true;
         if (eqlIgnoreCase(ignore_case, name, "network"))
+            return true;
+    }
+
+    if (target.os.tag == .serenity) {
+        if (eqlIgnoreCase(ignore_case, name, "dl"))
+            return true;
+        if (eqlIgnoreCase(ignore_case, name, "m"))
+            return true;
+        if (eqlIgnoreCase(ignore_case, name, "pthread"))
+            return true;
+        if (eqlIgnoreCase(ignore_case, name, "ssp"))
             return true;
     }
 
