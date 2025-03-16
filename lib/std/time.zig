@@ -125,7 +125,7 @@ pub const Instant = struct {
 
     // true if we should use clock_gettime()
     const is_posix = switch (builtin.os.tag) {
-        .windows, .uefi, .wasi => false,
+        .windows, .uefi, .wasi, .freestanding => false,
         else => true,
     };
 
@@ -138,6 +138,11 @@ pub const Instant = struct {
             .windows => {
                 // QPC on windows doesn't fail on >= XP/2000 and includes time suspended.
                 return .{ .timestamp = windows.QueryPerformanceCounter() };
+            },
+            .freestanding => b: {
+                if(@hasDecl(@import("root"), "instant"))
+                    return @import("root").instant();
+                break :b posix.CLOCK.MONOTONIC;
             },
             .wasi => {
                 var ns: std.os.wasi.timestamp_t = undefined;
