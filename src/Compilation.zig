@@ -827,7 +827,7 @@ pub const MiscTask = enum {
 
     @"mingw-w64 crt2.o",
     @"mingw-w64 dllcrt2.o",
-    @"mingw-w64 mingw32.lib",
+    @"mingw-w64 libmingw32.lib",
 };
 
 pub const MiscError = struct {
@@ -1074,7 +1074,6 @@ pub const CreateOptions = struct {
     /// executable this field is ignored.
     want_compiler_rt: ?bool = null,
     want_ubsan_rt: ?bool = null,
-    want_lto: ?bool = null,
     function_sections: bool = false,
     data_sections: bool = false,
     time_report: bool = false,
@@ -1512,7 +1511,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             .emit_asm = options.emit_asm,
             .emit_llvm_ir = options.emit_llvm_ir,
             .emit_llvm_bc = options.emit_llvm_bc,
-            .work_queues = .{std.fifo.LinearFifo(Job, .Dynamic).init(gpa)} ** @typeInfo(std.meta.FieldType(Compilation, .work_queues)).array.len,
+            .work_queues = @splat(.init(gpa)),
             .c_object_work_queue = std.fifo.LinearFifo(*CObject, .Dynamic).init(gpa),
             .win32_resource_work_queue = if (dev.env.supports(.win32_resource)) std.fifo.LinearFifo(*Win32Resource, .Dynamic).init(gpa) else .{},
             .astgen_work_queue = std.fifo.LinearFifo(Zcu.File.Index, .Dynamic).init(gpa),
@@ -1886,7 +1885,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
 
                     const main_crt_file: mingw.CrtFile = if (is_dyn_lib) .dllcrt2_o else .crt2_o;
                     comp.queued_jobs.mingw_crt_file[@intFromEnum(main_crt_file)] = true;
-                    comp.queued_jobs.mingw_crt_file[@intFromEnum(mingw.CrtFile.mingw32_lib)] = true;
+                    comp.queued_jobs.mingw_crt_file[@intFromEnum(mingw.CrtFile.libmingw32_lib)] = true;
                     comp.remaining_prelink_tasks += 2;
 
                     // When linking mingw-w64 there are some import libs we always need.
@@ -5628,6 +5627,31 @@ pub fn addCCArgs(
     const llvm_triple = try @import("codegen/llvm.zig").targetTriple(arena, target);
     try argv.appendSlice(&[_][]const u8{ "-target", llvm_triple });
 
+    switch (target.os.tag) {
+        .ios, .macos, .tvos, .watchos => |os| {
+            try argv.ensureUnusedCapacity(2);
+            // Pass the proper -m<os>-version-min argument for darwin.
+            const ver = target.os.version_range.semver.min;
+            argv.appendAssumeCapacity(try std.fmt.allocPrint(arena, "-m{s}{s}-version-min={d}.{d}.{d}", .{
+                switch (target.abi) {
+                    .simulator => "-simulator",
+                    else => "",
+                },
+                @tagName(os),
+                ver.major,
+                ver.minor,
+                ver.patch,
+            }));
+            // This avoids a warning that sometimes occurs when
+            // providing both a -target argument that contains a
+            // version as well as the -mmacosx-version-min argument.
+            // Zig provides the correct value in both places, so it
+            // doesn't matter which one gets overridden.
+            argv.appendAssumeCapacity("-Wno-overriding-option");
+        },
+        else => {},
+    }
+
     if (target.cpu.arch.isArm()) {
         try argv.append(if (target.cpu.arch.isThumb()) "-mthumb" else "-mno-thumb");
     }
@@ -5741,11 +5765,17 @@ pub fn addCCArgs(
 
         // LLVM IR files don't support these flags.
         if (ext != .ll and ext != .bc) {
-            // https://github.com/llvm/llvm-project/issues/105972
-            if (target.cpu.arch.isPowerPC() and target.abi.float() == .soft) {
-                try argv.append("-D__NO_FPRS__");
-                try argv.append("-D_SOFT_FLOAT");
-                try argv.append("-D_SOFT_DOUBLE");
+            switch (mod.optimize_mode) {
+                .Debug => {
+                    // windows c runtime requires -D_DEBUG if using debug libraries
+                    try argv.append("-D_DEBUG");
+                },
+                .ReleaseSafe => {
+                    try argv.append("-D_FORTIFY_SOURCE=2");
+                },
+                .ReleaseFast, .ReleaseSmall => {
+                    try argv.append("-DNDEBUG");
+                },
             }
 
             if (comp.config.link_libc) {
@@ -5776,29 +5806,7 @@ pub fn addCCArgs(
                     comp.zig_lib_directory.path.?, "libcxxabi", "include",
                 }));
 
-                if (target.abi.isMusl()) {
-                    try argv.append("-D_LIBCPP_HAS_MUSL_LIBC");
-                }
-
-                try argv.append("-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS");
-                try argv.append("-D_LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS");
-                try argv.append("-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS");
-
-                if (!comp.config.any_non_single_threaded) {
-                    try argv.append("-D_LIBCPP_HAS_NO_THREADS");
-                }
-
-                // See the comment in libcxx.zig for more details about this.
-                try argv.append("-D_LIBCPP_PSTL_BACKEND_SERIAL");
-
-                try argv.append(try std.fmt.allocPrint(arena, "-D_LIBCPP_ABI_VERSION={d}", .{
-                    @intFromEnum(comp.libcxx_abi_version),
-                }));
-                try argv.append(try std.fmt.allocPrint(arena, "-D_LIBCPP_ABI_NAMESPACE=__{d}", .{
-                    @intFromEnum(comp.libcxx_abi_version),
-                }));
-
-                try argv.append(libcxx.hardeningModeFlag(mod.optimize_mode));
+                try libcxx.addCxxArgs(comp, arena, argv);
             }
 
             // According to Rich Felker libc headers are supposed to go before C language headers.
@@ -5838,6 +5846,32 @@ pub fn addCCArgs(
                 try argv.appendSlice(&.{ "-F", framework_dir });
             }
         }
+    }
+
+    // Only C-family files support these flags.
+    switch (ext) {
+        .c,
+        .h,
+        .cpp,
+        .hpp,
+        .m,
+        .hm,
+        .mm,
+        .hmm,
+        => {
+            try argv.append("-fno-spell-checking");
+
+            if (target.os.tag == .windows and target.abi.isGnu()) {
+                // windows.h has files such as pshpack1.h which do #pragma packing,
+                // triggering a clang warning. So for this target, we disable this warning.
+                try argv.append("-Wno-pragma-pack");
+            }
+
+            if (mod.optimize_mode != .Debug) {
+                try argv.append("-Werror=date-time");
+            }
+        },
+        else => {},
     }
 
     // Only assembly files support these flags.
@@ -5914,7 +5948,7 @@ pub fn addCCArgs(
         else => {},
     }
 
-    // Only C-family files support these flags.
+    // Only compiled files support these flags.
     switch (ext) {
         .c,
         .h,
@@ -5924,9 +5958,9 @@ pub fn addCCArgs(
         .hm,
         .mm,
         .hmm,
+        .ll,
+        .bc,
         => {
-            try argv.append("-fno-spell-checking");
-
             if (target_util.clangSupportsTargetCpuArg(target)) {
                 if (target.cpu.model.llvm_name) |llvm_name| {
                     try argv.appendSlice(&[_][]const u8{
@@ -5943,56 +5977,16 @@ pub fn addCCArgs(
                 const is_enabled = target.cpu.features.isEnabled(index);
 
                 if (feature.llvm_name) |llvm_name| {
-                    // We communicate float ABI to Clang through the dedicated options further down.
-                    if (std.mem.eql(u8, llvm_name, "soft-float")) continue;
+                    // We communicate float ABI to Clang through the dedicated options.
+                    if (std.mem.startsWith(u8, llvm_name, "soft-float") or
+                        std.mem.startsWith(u8, llvm_name, "hard-float"))
+                        continue;
 
                     argv.appendSliceAssumeCapacity(&[_][]const u8{ "-Xclang", "-target-feature", "-Xclang" });
                     const plus_or_minus = "-+"[@intFromBool(is_enabled)];
                     const arg = try std.fmt.allocPrint(arena, "{c}{s}", .{ plus_or_minus, llvm_name });
                     argv.appendAssumeCapacity(arg);
                 }
-            }
-
-            switch (target.os.tag) {
-                .windows => {
-                    // windows.h has files such as pshpack1.h which do #pragma packing,
-                    // triggering a clang warning. So for this target, we disable this warning.
-                    if (target.abi.isGnu()) {
-                        try argv.append("-Wno-pragma-pack");
-                    }
-                },
-                .macos => {
-                    try argv.ensureUnusedCapacity(2);
-                    // Pass the proper -m<os>-version-min argument for darwin.
-                    const ver = target.os.version_range.semver.min;
-                    argv.appendAssumeCapacity(try std.fmt.allocPrint(arena, "-mmacos-version-min={d}.{d}.{d}", .{
-                        ver.major, ver.minor, ver.patch,
-                    }));
-                    // This avoids a warning that sometimes occurs when
-                    // providing both a -target argument that contains a
-                    // version as well as the -mmacosx-version-min argument.
-                    // Zig provides the correct value in both places, so it
-                    // doesn't matter which one gets overridden.
-                    argv.appendAssumeCapacity("-Wno-overriding-option");
-                },
-                .ios => switch (target.cpu.arch) {
-                    // Pass the proper -m<os>-version-min argument for darwin.
-                    .x86, .x86_64 => {
-                        const ver = target.os.version_range.semver.min;
-                        try argv.append(try std.fmt.allocPrint(
-                            arena,
-                            "-m{s}-simulator-version-min={d}.{d}.{d}",
-                            .{ @tagName(target.os.tag), ver.major, ver.minor, ver.patch },
-                        ));
-                    },
-                    else => {
-                        const ver = target.os.version_range.semver.min;
-                        try argv.append(try std.fmt.allocPrint(arena, "-m{s}-version-min={d}.{d}.{d}", .{
-                            @tagName(target.os.tag), ver.major, ver.minor, ver.patch,
-                        }));
-                    },
-                },
-                else => {},
             }
 
             {
@@ -6055,8 +6049,6 @@ pub fn addCCArgs(
 
             switch (mod.optimize_mode) {
                 .Debug => {
-                    // windows c runtime requires -D_DEBUG if using debug libraries
-                    try argv.append("-D_DEBUG");
                     // Clang has -Og for compatibility with GCC, but currently it is just equivalent
                     // to -O1. Besides potentially impairing debugging, -O1/-Og significantly
                     // increases compile times.
@@ -6066,10 +6058,8 @@ pub fn addCCArgs(
                     // See the comment in the BuildModeFastRelease case for why we pass -O2 rather
                     // than -O3 here.
                     try argv.append("-O2");
-                    try argv.append("-D_FORTIFY_SOURCE=2");
                 },
                 .ReleaseFast => {
-                    try argv.append("-DNDEBUG");
                     // Here we pass -O2 rather than -O3 because, although we do the equivalent of
                     // -O3 in Zig code, the justification for the difference here is that Zig
                     // has better detection and prevention of undefined behavior, so -O3 is safer for
@@ -6078,13 +6068,8 @@ pub fn addCCArgs(
                     try argv.append("-O2");
                 },
                 .ReleaseSmall => {
-                    try argv.append("-DNDEBUG");
                     try argv.append("-Os");
                 },
-            }
-
-            if (mod.optimize_mode != .Debug) {
-                try argv.append("-Werror=date-time");
             }
         },
         else => {},

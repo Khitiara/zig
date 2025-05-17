@@ -2327,11 +2327,11 @@ fn failWithNeededComptime(sema: *Sema, block: *Block, src: LazySrcLoc, reason: ?
 }
 
 pub fn failWithUseOfUndef(sema: *Sema, block: *Block, src: LazySrcLoc) CompileError {
-    return sema.fail(block, src, "use of undefined value here causes undefined behavior", .{});
+    return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
 }
 
 pub fn failWithDivideByZero(sema: *Sema, block: *Block, src: LazySrcLoc) CompileError {
-    return sema.fail(block, src, "division by zero here causes undefined behavior", .{});
+    return sema.fail(block, src, "division by zero here causes illegal behavior", .{});
 }
 
 fn failWithModRemNegative(sema: *Sema, block: *Block, src: LazySrcLoc, lhs_ty: Type, rhs_ty: Type) CompileError {
@@ -2998,7 +2998,7 @@ fn zirStructDecl(
     return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
 }
 
-fn createTypeName(
+pub fn createTypeName(
     sema: *Sema,
     block: *Block,
     name_strategy: Zir.Inst.NameStrategy,
@@ -3648,7 +3648,7 @@ fn indexablePtrLen(
     const object_ty = sema.typeOf(object);
     const is_pointer_to = object_ty.isSinglePointer(zcu);
     const indexable_ty = if (is_pointer_to) object_ty.childType(zcu) else object_ty;
-    try checkIndexable(sema, block, src, indexable_ty);
+    try sema.checkIndexable(block, src, indexable_ty);
     const field_name = try zcu.intern_pool.getOrPutString(sema.gpa, pt.tid, "len", .no_embedded_nulls);
     return sema.fieldVal(block, src, object, field_name, src);
 }
@@ -10103,6 +10103,7 @@ fn zirIntFromPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     }
     try sema.requireRuntimeBlock(block, block.nodeOffset(inst_data.src_node), ptr_src);
     try sema.validateRuntimeValue(block, ptr_src, operand);
+    try sema.checkLogicalPtrOperation(block, ptr_src, ptr_ty);
     if (!is_vector or zcu.backendSupportsFeature(.all_vector_instructions)) {
         return block.addBitCast(dest_ty, operand);
     }
@@ -13518,7 +13519,7 @@ fn validateErrSetSwitch(
     seen_errors: *SwitchErrorSet,
     case_vals: *std.ArrayListUnmanaged(Air.Inst.Ref),
     operand_ty: Type,
-    inst_data: std.meta.FieldType(Zir.Inst.Data, .pl_node),
+    inst_data: @FieldType(Zir.Inst.Data, "pl_node"),
     scalar_cases_len: u32,
     multi_cases_len: u32,
     else_case: struct { body: []const Zir.Inst.Index, end: usize, src: LazySrcLoc },
@@ -14064,14 +14065,13 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.
             return Air.internedToRef(ty);
         },
         .zon => {
-            if (extra.res_ty == .none) {
-                return sema.fail(block, operand_src, "'@import' of ZON must have a known result type", .{});
-            }
-            const res_ty_inst = try sema.resolveInst(extra.res_ty);
-            const res_ty = try sema.analyzeAsType(block, operand_src, res_ty_inst);
-            if (res_ty.isGenericPoison()) {
-                return sema.fail(block, operand_src, "'@import' of ZON must have a known result type", .{});
-            }
+            const res_ty: InternPool.Index = b: {
+                if (extra.res_ty == .none) break :b .none;
+                const res_ty_inst = try sema.resolveInst(extra.res_ty);
+                const res_ty = try sema.analyzeAsType(block, operand_src, res_ty_inst);
+                if (res_ty.isGenericPoison()) break :b .none;
+                break :b res_ty.toIntern();
+            };
 
             try sema.declareDependency(.{ .zon_file = result.file_index });
             const interned = try LowerZon.run(
@@ -15495,7 +15495,7 @@ fn zirDivExact(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
     }
 
     // Depending on whether safety is enabled, we will have a slightly different strategy
-    // here. The `div_exact` AIR instruction causes undefined behavior if a remainder
+    // here. The `div_exact` AIR instruction causes illegal behavior if a remainder
     // is produced, so in the safety check case, it cannot be used. Instead we do a
     // div_trunc and check for remainder.
 
@@ -16389,6 +16389,8 @@ fn analyzeArithmetic(
                 };
 
                 try sema.requireRuntimeBlock(block, src, runtime_src);
+                try sema.checkLogicalPtrOperation(block, src, lhs_ty);
+                try sema.checkLogicalPtrOperation(block, src, rhs_ty);
                 const lhs_int = try block.addBitCast(.usize, lhs);
                 const rhs_int = try block.addBitCast(.usize, rhs);
                 const address = try block.addBinOp(.sub_wrap, lhs_int, rhs_int);
@@ -16620,24 +16622,7 @@ fn analyzePtrArithmetic(
     };
 
     try sema.requireRuntimeBlock(block, op_src, runtime_src);
-
-    const target = zcu.getTarget();
-    if (target_util.arePointersLogical(target, ptr_info.flags.address_space)) {
-        return sema.failWithOwnedErrorMsg(block, msg: {
-            const msg = try sema.errMsg(op_src, "illegal pointer arithmetic on pointer of type '{}'", .{ptr_ty.fmt(pt)});
-            errdefer msg.destroy(sema.gpa);
-
-            const backend = target_util.zigBackend(target, zcu.comp.config.use_llvm);
-            try sema.errNote(op_src, msg, "arithmetic cannot be performed on pointers with address space '{s}' on target {s}-{s} by compiler backend {s}", .{
-                @tagName(ptr_info.flags.address_space),
-                target.cpu.arch.genericName(),
-                @tagName(target.os.tag),
-                @tagName(backend),
-            });
-
-            break :msg msg;
-        });
-    }
+    try sema.checkLogicalPtrOperation(block, op_src, ptr_ty);
 
     return block.addInst(.{
         .tag = air_tag,
@@ -16676,9 +16661,9 @@ fn zirAsm(
     const extra = sema.code.extraData(Zir.Inst.Asm, extended.operand);
     const src = block.nodeOffset(extra.data.src_node);
     const ret_ty_src = block.src(.{ .node_offset_asm_ret_ty = extra.data.src_node });
-    const outputs_len: u5 = @truncate(extended.small);
-    const inputs_len: u5 = @truncate(extended.small >> 5);
-    const clobbers_len: u5 = @truncate(extended.small >> 10);
+    const outputs_len: u4 = @truncate(extended.small);
+    const inputs_len: u5 = @truncate(extended.small >> 4);
+    const clobbers_len: u6 = @truncate(extended.small >> 9);
     const is_volatile = @as(u1, @truncate(extended.small >> 15)) != 0;
     const is_global_assembly = sema.func_index == .none;
     const zir_tags = sema.code.instructions.items(.tag);
@@ -19241,7 +19226,7 @@ fn retWithErrTracing(
     const return_err_fn = Air.internedToRef(try sema.getBuiltin(src, .returnError));
 
     if (!need_check) {
-        try sema.callBuiltin(block, src, return_err_fn, .never_inline, &.{}, .@"error return");
+        try sema.callBuiltin(block, src, return_err_fn, .never_tail, &.{}, .@"error return");
         _ = try block.addUnOp(ret_tag, operand);
         return;
     }
@@ -19252,7 +19237,7 @@ fn retWithErrTracing(
 
     var else_block = block.makeSubBlock();
     defer else_block.instructions.deinit(gpa);
-    try sema.callBuiltin(&else_block, src, return_err_fn, .never_inline, &.{}, .@"error return");
+    try sema.callBuiltin(&else_block, src, return_err_fn, .never_tail, &.{}, .@"error return");
     _ = try else_block.addUnOp(ret_tag, operand);
 
     try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.CondBr).@"struct".fields.len +
@@ -22501,6 +22486,7 @@ fn zirPtrFromInt(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         });
     }
     try sema.requireRuntimeBlock(block, src, operand_src);
+    try sema.checkLogicalPtrOperation(block, src, ptr_ty);
     if (!is_vector or zcu.backendSupportsFeature(.all_vector_instructions)) {
         if (block.wantSafety() and (try elem_ty.hasRuntimeBitsSema(pt) or elem_ty.zigTypeTag(zcu) == .@"fn")) {
             if (!ptr_ty.isAllowzeroPtr(zcu)) {
@@ -22850,11 +22836,14 @@ fn ptrCastFull(
         if (src_slice_like_elem.comptimeOnly(zcu) or dest_elem.comptimeOnly(zcu)) {
             return sema.fail(block, src, "cannot infer length of slice of '{}' from slice of '{}'", .{ dest_elem.fmt(pt), src_slice_like_elem.fmt(pt) });
         }
-        const src_elem_size = src_slice_like_elem.abiSize(zcu);
+        // It's okay for `src_slice_like_elem` to be 0-bit; the resulting slice will just always have 0 elements.
+        // However, `dest_elem` can't be 0-bit. If it were, then either the source slice has 0 bits and we don't
+        // know how what `result.len` should be, or the source has >0 bits and there is no valid `result.len`.
         const dest_elem_size = dest_elem.abiSize(zcu);
-        if (src_elem_size == 0 or dest_elem_size == 0) {
+        if (dest_elem_size == 0) {
             return sema.fail(block, src, "cannot infer length of slice of '{}' from slice of '{}'", .{ dest_elem.fmt(pt), src_slice_like_elem.fmt(pt) });
         }
+        const src_elem_size = src_slice_like_elem.abiSize(zcu);
         break :need_len_change src_elem_size != dest_elem_size;
     } else false;
 
@@ -23165,8 +23154,9 @@ fn ptrCastFull(
 
     try sema.validateRuntimeValue(block, operand_src, operand);
 
-    const need_null_check = block.wantSafety() and operand_ty.ptrAllowsZero(zcu) and !dest_ty.ptrAllowsZero(zcu);
-    const need_align_check = block.wantSafety() and dest_align.compare(.gt, src_align);
+    const can_cast_to_int = !target_util.arePointersLogical(zcu.getTarget(), operand_ty.ptrAddressSpace(zcu));
+    const need_null_check = can_cast_to_int and block.wantSafety() and operand_ty.ptrAllowsZero(zcu) and !dest_ty.ptrAllowsZero(zcu);
+    const need_align_check = can_cast_to_int and block.wantSafety() and dest_align.compare(.gt, src_align);
 
     // `operand` might be a slice. If `need_operand_ptr`, we'll populate `operand_ptr` with the raw pointer.
     const need_operand_ptr = src_info.flags.size != .slice or // we already have it
@@ -23830,6 +23820,32 @@ fn checkPtrType(
         else => {},
     }
     return sema.fail(block, ty_src, "expected pointer type, found '{}'", .{ty.fmt(pt)});
+}
+
+fn checkLogicalPtrOperation(sema: *Sema, block: *Block, src: LazySrcLoc, ty: Type) !void {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+    if (zcu.intern_pool.indexToKey(ty.toIntern()) == .ptr_type) {
+        const target = zcu.getTarget();
+        const as = ty.ptrAddressSpace(zcu);
+        if (target_util.arePointersLogical(target, as)) {
+            return sema.failWithOwnedErrorMsg(block, msg: {
+                const msg = try sema.errMsg(src, "illegal operation on logical pointer of type '{}'", .{ty.fmt(pt)});
+                errdefer msg.destroy(sema.gpa);
+                try sema.errNote(
+                    src,
+                    msg,
+                    "cannot perform arithmetic on pointers with address space '{s}' on target {s}-{s}",
+                    .{
+                        @tagName(as),
+                        target.cpu.arch.genericName(),
+                        @tagName(target.os.tag),
+                    },
+                );
+                break :msg msg;
+            });
+        }
+    }
 }
 
 fn checkVectorElemType(
@@ -25252,7 +25268,7 @@ fn ptrSubtract(sema: *Sema, block: *Block, src: LazySrcLoc, ptr_val: Value, byte
     };
     if (ptr.byte_offset < byte_subtract) {
         return sema.failWithOwnedErrorMsg(block, msg: {
-            const msg = try sema.errMsg(src, "pointer computation here causes undefined behavior", .{});
+            const msg = try sema.errMsg(src, "pointer computation here causes illegal behavior", .{});
             errdefer msg.destroy(sema.gpa);
             try sema.errNote(src, msg, "resulting pointer exceeds bounds of containing value which may trigger overflow", .{});
             break :msg msg;
@@ -25712,12 +25728,14 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
             var info = dest_ty.ptrInfo(zcu);
             info.flags.size = .one;
             info.child = array_ty.toIntern();
+            info.sentinel = .none;
             break :info info;
         });
         const src_array_ptr_ty = try pt.ptrType(info: {
             var info = src_ty.ptrInfo(zcu);
             info.flags.size = .one;
             info.child = array_ty.toIntern();
+            info.sentinel = .none;
             break :info info;
         });
 
@@ -25998,13 +26016,12 @@ fn zirFuncFancy(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
         break :cc .auto;
     };
 
-    const ret_ty: Type = if (extra.data.bits.ret_ty_is_generic)
-        .generic_poison
-    else if (extra.data.bits.has_ret_ty_body) blk: {
+    const ret_ty: Type = if (extra.data.bits.has_ret_ty_body) blk: {
         const body_len = sema.code.extra[extra_index];
         extra_index += 1;
         const body = sema.code.bodySlice(extra_index, body_len);
         extra_index += body.len;
+        if (extra.data.bits.ret_ty_is_generic) break :blk .generic_poison;
 
         const val = try sema.resolveGenericBody(block, ret_src, body, inst, Type.type, .{ .simple = .function_ret_ty });
         const ty = val.toType();
@@ -26012,6 +26029,8 @@ fn zirFuncFancy(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
     } else if (extra.data.bits.has_ret_ty_ref) blk: {
         const ret_ty_ref: Zir.Inst.Ref = @enumFromInt(sema.code.extra[extra_index]);
         extra_index += 1;
+        if (extra.data.bits.ret_ty_is_generic) break :blk .generic_poison;
+
         const ret_ty_air_ref = try sema.resolveInst(ret_ty_ref);
         const ret_ty_val = try sema.resolveConstDefinedValue(block, ret_src, ret_ty_air_ref, .{ .simple = .function_ret_ty });
         break :blk ret_ty_val.toType();
@@ -28326,7 +28345,7 @@ fn elemPtr(
         .pointer => indexable_ptr_ty.childType(zcu),
         else => return sema.fail(block, indexable_ptr_src, "expected pointer, found '{}'", .{indexable_ptr_ty.fmt(pt)}),
     };
-    try checkIndexable(sema, block, src, indexable_ty);
+    try sema.checkIndexable(block, src, indexable_ty);
 
     const elem_ptr = switch (indexable_ty.zigTypeTag(zcu)) {
         .array, .vector => try sema.elemPtrArray(block, src, indexable_ptr_src, indexable_ptr, elem_index_src, elem_index, init, oob_safety),
@@ -28362,7 +28381,7 @@ fn elemPtrOneLayerOnly(
     const pt = sema.pt;
     const zcu = pt.zcu;
 
-    try checkIndexable(sema, block, src, indexable_ty);
+    try sema.checkIndexable(block, src, indexable_ty);
 
     switch (indexable_ty.ptrSize(zcu)) {
         .slice => return sema.elemPtrSlice(block, src, indexable_src, indexable, elem_index_src, elem_index, oob_safety),
@@ -28376,6 +28395,8 @@ fn elemPtrOneLayerOnly(
                 const elem_ptr = try ptr_val.ptrElem(index, pt);
                 return Air.internedToRef(elem_ptr.toIntern());
             }
+
+            try sema.checkLogicalPtrOperation(block, src, indexable_ty);
             const result_ty = try indexable_ty.elemPtrType(null, pt);
 
             return block.addPtrElemPtr(indexable, elem_index, result_ty);
@@ -28412,7 +28433,7 @@ fn elemVal(
     const pt = sema.pt;
     const zcu = pt.zcu;
 
-    try checkIndexable(sema, block, src, indexable_ty);
+    try sema.checkIndexable(block, src, indexable_ty);
 
     // TODO in case of a vector of pointers, we need to detect whether the element
     // index is a scalar or vector instead of unconditionally casting to usize.
@@ -28438,6 +28459,7 @@ fn elemVal(
                     return Air.internedToRef((try pt.getCoerced(elem_val, elem_ty)).toIntern());
                 }
 
+                try sema.checkLogicalPtrOperation(block, src, indexable_ty);
                 return block.addBinOp(.ptr_elem_val, indexable, elem_index);
             },
             .one => {
@@ -28477,6 +28499,9 @@ fn validateRuntimeElemAccess(
     parent_ty: Type,
     parent_src: LazySrcLoc,
 ) CompileError!void {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+
     if (try elem_ty.comptimeOnlySema(sema.pt)) {
         const msg = msg: {
             const msg = try sema.errMsg(
@@ -28491,6 +28516,14 @@ fn validateRuntimeElemAccess(
             break :msg msg;
         };
         return sema.failWithOwnedErrorMsg(block, msg);
+    }
+
+    if (zcu.intern_pool.indexToKey(parent_ty.toIntern()) == .ptr_type) {
+        const target = zcu.getTarget();
+        const as = parent_ty.ptrAddressSpace(zcu);
+        if (target_util.arePointersLogical(target, as)) {
+            return sema.fail(block, elem_index_src, "cannot access element of logical pointer '{}'", .{parent_ty.fmt(pt)});
+        }
     }
 }
 
@@ -30394,20 +30427,17 @@ fn coerceInMemoryAllowedFns(
             } };
         }
 
-        switch (src_param_ty.toIntern()) {
-            .generic_poison_type => {},
-            else => {
-                // Note: Cast direction is reversed here.
-                const param = try sema.coerceInMemoryAllowed(block, src_param_ty, dest_param_ty, dest_is_mut, target, dest_src, src_src, null);
-                if (param != .ok) {
-                    return .{ .fn_param = .{
-                        .child = try param.dupe(sema.arena),
-                        .actual = src_param_ty,
-                        .wanted = dest_param_ty,
-                        .index = param_i,
-                    } };
-                }
-            },
+        if (!src_param_ty.isGenericPoison() and !dest_param_ty.isGenericPoison()) {
+            // Note: Cast direction is reversed here.
+            const param = try sema.coerceInMemoryAllowed(block, src_param_ty, dest_param_ty, dest_is_mut, target, dest_src, src_src, null);
+            if (param != .ok) {
+                return .{ .fn_param = .{
+                    .child = try param.dupe(sema.arena),
+                    .actual = src_param_ty,
+                    .wanted = dest_param_ty,
+                    .index = param_i,
+                } };
+            }
         }
     }
 
@@ -31158,6 +31188,7 @@ fn coerceCompatiblePtrs(
     if (block.wantSafety() and inst_allows_zero and !dest_ty.ptrAllowsZero(zcu) and
         (try dest_ty.elemType2(zcu).hasRuntimeBitsSema(pt) or dest_ty.elemType2(zcu).zigTypeTag(zcu) == .@"fn"))
     {
+        try sema.checkLogicalPtrOperation(block, inst_src, inst_ty);
         const actual_ptr = if (inst_ty.isSlice(zcu))
             try sema.analyzeSlicePtr(block, inst_src, inst, inst_ty)
         else
@@ -31667,7 +31698,7 @@ fn addReferenceEntry(
     try zcu.addUnitReference(sema.owner, referenced_unit, src);
 }
 
-fn addTypeReferenceEntry(
+pub fn addTypeReferenceEntry(
     sema: *Sema,
     src: LazySrcLoc,
     referenced_type: InternPool.Index,
@@ -36348,6 +36379,10 @@ pub fn typeHasOnePossibleValue(sema: *Sema, ty: Type) CompileError!?Value {
         .slice_const_u8_sentinel_0_type,
         .vector_16_i8_type,
         .vector_32_i8_type,
+        .vector_1_u8_type,
+        .vector_2_u8_type,
+        .vector_4_u8_type,
+        .vector_8_u8_type,
         .vector_16_u8_type,
         .vector_32_u8_type,
         .vector_8_i16_type,

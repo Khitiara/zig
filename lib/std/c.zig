@@ -1601,10 +1601,6 @@ pub const MSF = switch (native_os) {
     },
     else => void,
 };
-pub const MMAP2_UNIT = switch (native_os) {
-    .linux => linux.MMAP2_UNIT,
-    else => void,
-};
 pub const NAME_MAX = switch (native_os) {
     .linux => linux.NAME_MAX,
     .emscripten => emscripten.NAME_MAX,
@@ -10196,10 +10192,12 @@ pub extern "c" fn sendfile64(out_fd: fd_t, in_fd: fd_t, offset: ?*i64, count: us
 pub extern "c" fn setrlimit64(resource: rlimit_resource, rlim: *const rlimit) c_int;
 
 pub const arc4random_buf = switch (native_os) {
-    .dragonfly, .netbsd, .freebsd, .solaris, .openbsd, .macos, .ios, .tvos, .watchos, .visionos, .serenity => private.arc4random_buf,
+    .linux => if (builtin.abi.isAndroid()) private.arc4random_buf else {},
+    .dragonfly, .netbsd, .freebsd, .solaris, .openbsd, .macos, .ios, .tvos, .watchos, .visionos => private.arc4random_buf,
     else => {},
 };
 pub const getentropy = switch (native_os) {
+    .linux => if (builtin.abi.isAndroid() and versionCheck(.{ .major = 28, .minor = 0, .patch = 0 })) private.getentropy else {},
     .emscripten => private.getentropy,
     else => {},
 };
@@ -10545,6 +10543,8 @@ pub extern "c" fn setregid(rgid: gid_t, egid: gid_t) c_int;
 pub extern "c" fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) c_int;
 pub extern "c" fn setresgid(rgid: gid_t, egid: gid_t, sgid: gid_t) c_int;
 pub extern "c" fn setpgid(pid: pid_t, pgid: pid_t) c_int;
+pub extern "c" fn getuid() uid_t;
+pub extern "c" fn geteuid() uid_t;
 
 pub extern "c" fn malloc(usize) ?*anyopaque;
 pub extern "c" fn calloc(usize, usize) ?*anyopaque;
