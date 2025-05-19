@@ -2085,7 +2085,7 @@ pub fn readEhPointer(fbr: *FixedBufferReader, enc: u8, addr_size_bytes: u8, ctx:
     };
 
     const ptr: u64 = if (base) |b| switch (value) {
-        .signed => |s| @intCast(try std.math.add(i64, s, @as(i64, @intCast(b)))),
+        .signed => |s| @intCast(try std.math.add(i65, s, @as(i65, @intCast(b)))),
         // absptr can actually contain signed values in some cases (aarch64 MachO)
         .unsigned => |u| u +% b,
     } else switch (value) {
