@@ -45,16 +45,7 @@ pub fn open(allocator: Allocator) OpenError!SelfInfo {
         if (builtin.strip_debug_info)
             return error.MissingDebugInfo;
         switch (native_os) {
-            .linux,
-            .freebsd,
-            .netbsd,
-            .dragonfly,
-            .openbsd,
-            .macos,
-            .solaris,
-            .illumos,
-            .windows,
-            => return try SelfInfo.init(allocator),
+            .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .macos, .solaris, .illumos, .windows, .other => return try SelfInfo.init(allocator),
             else => return error.UnsupportedOperatingSystem,
         }
     }
@@ -130,6 +121,8 @@ pub fn getModuleForAddress(self: *SelfInfo, address: usize) !*Module {
         return self.lookupModuleHaiku(address);
     } else if (builtin.target.cpu.arch.isWasm()) {
         return self.lookupModuleWasm(address);
+    } else if (native_os == .other) {
+        return self.lookupModuleOther(address);
     } else {
         return self.lookupModuleDl(address);
     }
@@ -143,7 +136,7 @@ pub fn getModuleNameForAddress(self: *SelfInfo, address: usize) ?[]const u8 {
         return self.lookupModuleNameDyld(address);
     } else if (native_os == .windows) {
         return self.lookupModuleNameWin32(address);
-    } else if (native_os == .haiku) {
+    } else if (native_os == .haiku or native_os == .other) {
         return null;
     } else if (builtin.target.cpu.arch.isWasm()) {
         return null;
@@ -493,6 +486,71 @@ fn lookupModuleWasm(self: *SelfInfo, address: usize) !*Module {
     @panic("TODO implement lookup module for Wasm");
 }
 
+fn load2Noop(_: std.mem.Allocator) ![]align(std.heap.page_size_min) const u8 {
+    return error.MissingDebugInfo;
+}
+
+fn lookupModuleOther(self: *SelfInfo, address: usize) !*Module {
+    _ = address;
+
+    if (self.address_map.get(0)) |di| {
+        return di;
+    }
+
+    const module = try self.allocator.create(Module);
+    errdefer self.allocator.destroy(module);
+
+    module.* = try load2(self.allocator);
+
+    switch (module.*) {
+        .dwarf => |*dwarf_info| dwarf_info.base_address = 0,
+        .symtab => |*symtab| symtab.base_address = 0,
+    }
+
+    // Missing unwind info isn't treated as a failure, as the unwinder will fall back to FP-based unwinding
+    module.scanAllUnwindInfo(self.allocator, 0) catch {};
+
+    try self.address_map.putNoClobber(0, module);
+
+    return module;
+}
+
+fn load2(allocator: Allocator) !Module {
+    if (!@hasDecl(root, "mapSelfExe")) @panic("Freestanding self-exe missing for debug info");
+    const mapped_mem = try root.mapSelfExe(allocator);
+
+    load_dwarf: {
+        var sections: Dwarf.SectionArray = Dwarf.null_section_array;
+
+        const dwarf_info = Dwarf.ElfModule.load2(
+            allocator,
+            mapped_mem,
+            null,
+            &sections,
+            null,
+            if (@hasDecl(root, "mapExternalDebug")) root.mapExternalDebug else load2Noop,
+        ) catch {
+            break :load_dwarf;
+        };
+        return .{ .dwarf = dwarf_info };
+    }
+
+    load_symtab: {
+        const symtab = ElfSymTab.load(
+            allocator,
+            mapped_mem,
+            null,
+            // same special case here as for Dwarf
+            null,
+        ) catch {
+            break :load_symtab;
+        };
+        return .{ .symtab = symtab };
+    }
+
+    return error.MissingDebugInfo;
+}
+
 pub const Module = switch (native_os) {
     .macos, .ios, .watchos, .tvos, .visionos => struct {
         base_address: usize,
@@ -793,7 +851,7 @@ pub const Module = switch (native_os) {
             return .{};
         }
     },
-    .linux, .netbsd, .freebsd, .dragonfly, .openbsd, .haiku, .solaris, .illumos => union(enum) {
+    .linux, .netbsd, .freebsd, .dragonfly, .openbsd, .haiku, .solaris, .illumos, .other => union(enum) {
         dwarf: Dwarf.ElfModule,
         symtab: ElfSymTab,
 

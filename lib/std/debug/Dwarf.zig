@@ -2417,6 +2417,132 @@ pub const ElfModule = struct {
         };
     }
 
+    pub fn load2(
+        gpa: Allocator,
+        mapped_mem: []align(std.heap.page_size_min) const u8,
+        expected_crc: ?u32,
+        parent_sections: *Dwarf.SectionArray,
+        parent_mapped_mem: ?[]align(std.heap.page_size_min) const u8,
+        load_external: anytype,
+    ) LoadError!Dwarf.ElfModule {
+        if (expected_crc) |crc| if (crc != std.hash.crc.Crc32.hash(mapped_mem)) return error.InvalidDebugInfo;
+
+        const hdr: *const elf.Ehdr = @ptrCast(&mapped_mem[0]);
+        if (!mem.eql(u8, hdr.e_ident[0..4], elf.MAGIC)) return error.InvalidElfMagic;
+        if (hdr.e_ident[elf.EI_VERSION] != 1) return error.InvalidElfVersion;
+
+        const endian: std.builtin.Endian = switch (hdr.e_ident[elf.EI_DATA]) {
+            elf.ELFDATA2LSB => .little,
+            elf.ELFDATA2MSB => .big,
+            else => return error.InvalidElfEndian,
+        };
+        if (endian != native_endian) return error.UnimplementedDwarfForeignEndian;
+
+        const shoff = hdr.e_shoff;
+        const str_section_off = shoff + @as(u64, hdr.e_shentsize) * @as(u64, hdr.e_shstrndx);
+        const str_shdr: *const elf.Shdr = @ptrCast(@alignCast(&mapped_mem[cast(usize, str_section_off) orelse return error.Overflow]));
+        const header_strings = mapped_mem[str_shdr.sh_offset..][0..str_shdr.sh_size];
+        const shdrs = @as(
+            [*]const elf.Shdr,
+            @ptrCast(@alignCast(&mapped_mem[shoff])),
+        )[0..hdr.e_shnum];
+
+        var sections: Dwarf.SectionArray = Dwarf.null_section_array;
+
+        // Combine section list. This takes ownership over any owned sections from the parent scope.
+        for (parent_sections, &sections) |*parent, *section_elem| {
+            if (parent.*) |*p| {
+                section_elem.* = p.*;
+                p.owned = false;
+            }
+        }
+        errdefer for (sections) |opt_section| if (opt_section) |s| if (s.owned) gpa.free(s.data);
+
+        var separate_debug_filename: ?[]const u8 = null;
+        var separate_debug_crc: ?u32 = null;
+
+        for (shdrs) |*shdr| {
+            if (shdr.sh_type == elf.SHT_NULL or shdr.sh_type == elf.SHT_NOBITS) continue;
+            const name = mem.sliceTo(header_strings[shdr.sh_name..], 0);
+
+            if (mem.eql(u8, name, ".gnu_debuglink")) {
+                const gnu_debuglink = try chopSlice(mapped_mem, shdr.sh_offset, shdr.sh_size);
+                const debug_filename = mem.sliceTo(@as([*:0]const u8, @ptrCast(gnu_debuglink.ptr)), 0);
+                const crc_offset = mem.alignForward(usize, debug_filename.len + 1, 4);
+                const crc_bytes = gnu_debuglink[crc_offset..][0..4];
+                separate_debug_crc = mem.readInt(u32, crc_bytes, native_endian);
+                separate_debug_filename = debug_filename;
+                continue;
+            }
+
+            var section_index: ?usize = null;
+            inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields, 0..) |sect, i| {
+                if (mem.eql(u8, "." ++ sect.name, name)) section_index = i;
+            }
+            if (section_index == null) continue;
+            if (sections[section_index.?] != null) continue;
+
+            const section_bytes = try chopSlice(mapped_mem, shdr.sh_offset, shdr.sh_size);
+            sections[section_index.?] = if ((shdr.sh_flags & elf.SHF_COMPRESSED) > 0) blk: {
+                var section_stream = std.io.fixedBufferStream(section_bytes);
+                const section_reader = section_stream.reader();
+                const chdr = section_reader.readStruct(elf.Chdr) catch continue;
+                if (chdr.ch_type != .ZLIB) continue;
+
+                var zlib_stream = std.compress.zlib.decompressor(section_reader);
+
+                const decompressed_section = try gpa.alloc(u8, chdr.ch_size);
+                errdefer gpa.free(decompressed_section);
+
+                const read = zlib_stream.reader().readAll(decompressed_section) catch continue;
+                assert(read == decompressed_section.len);
+
+                break :blk .{
+                    .data = decompressed_section,
+                    .virtual_address = shdr.sh_addr,
+                    .owned = true,
+                };
+            } else .{
+                .data = section_bytes,
+                .virtual_address = shdr.sh_addr,
+                .owned = false,
+            };
+        }
+
+        const missing_debug_info =
+            sections[@intFromEnum(Dwarf.Section.Id.debug_info)] == null or
+            sections[@intFromEnum(Dwarf.Section.Id.debug_abbrev)] == null or
+            sections[@intFromEnum(Dwarf.Section.Id.debug_str)] == null or
+            sections[@intFromEnum(Dwarf.Section.Id.debug_line)] == null;
+
+        // Attempt to load debug info from an external file
+        // See: https://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
+        if (missing_debug_info) {
+            // Only allow one level of debug info nesting
+            if (parent_mapped_mem) |_| {
+                return error.MissingDebugInfo;
+            }
+
+            const child_mem = try load_external(gpa);
+            return load2(gpa, child_mem, separate_debug_crc, &sections, mapped_mem, load_external);
+        }
+
+        var di: Dwarf = .{
+            .endian = endian,
+            .sections = sections,
+            .is_macho = false,
+        };
+
+        try Dwarf.open(&di, gpa);
+
+        return .{
+            .base_address = 0,
+            .dwarf = di,
+            .mapped_memory = parent_mapped_mem orelse mapped_mem,
+            .external_mapped_memory = if (parent_mapped_mem != null) mapped_mem else null,
+        };
+    }
+
     pub fn loadPath(
         gpa: Allocator,
         elf_file_path: Path,
